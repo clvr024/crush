@@ -1,0 +1,74 @@
+name: Sync upstream and release
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository != 'charmbracelet/crush'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Merge upstream
+        id: merge
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git remote add upstream https://github.com/charmbracelet/crush.git
+          git fetch upstream main --tags
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            if [[ -z "$(git tag --list '*-yy.*')" ]]; then
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+          git merge --no-edit upstream/main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+      - name: Test merged code
+        if: steps.merge.outputs.should_release == 'true'
+        run: go test ./...
+
+      - name: Push merge
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:main
+
+      - name: Push release tag
+        if: steps.merge.outputs.should_release == 'true'
+        id: tag
+        shell: bash
+        run: |
+          upstream_tag="$(git tag --list 'v[0-9]*' --sort=-version:refname | grep -v -- '-yy\.' | head -n 1)"
+          if [[ -z "$upstream_tag" ]]; then
+            upstream_tag="v0.0.0"
+          fi
+          release_tag="${upstream_tag}-yy.${GITHUB_RUN_NUMBER}"
+          git tag "$release_tag"
+          git push origin "$release_tag"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        if: steps.merge.outputs.should_release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: go run github.com/goreleaser/goreleaser/v2@v2.12.7 release --clean --config .goreleaser-fork.yml

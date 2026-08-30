@@ -417,6 +417,7 @@ func (b *Backend) CreateWorkspace(args proto.Workspace) (*Workspace, proto.Works
 	}
 
 	cfg.Overrides().SkipPermissionRequests = args.YOLO
+	cfg.Overrides().AllowAllCommands = args.AllowAllCommands
 	cfg.Overrides().EnabledChannels = args.Channels
 
 	if err := createDotCrushDir(cfg.Config().Options.DataDirectory); err != nil {
@@ -1069,15 +1070,16 @@ func validateClientID(id string) (string, error) {
 func workspaceToProto(ws *Workspace) proto.Workspace {
 	cfg := ws.Cfg.Config()
 	out := proto.Workspace{
-		ID:       ws.ID,
-		Path:     ws.Path,
-		YOLO:     ws.Cfg.Overrides().SkipPermissionRequests,
-		Channels: ws.Cfg.Overrides().EnabledChannels,
-		DataDir:  cfg.Options.DataDirectory,
-		Debug:    cfg.Options.Debug,
-		Config:   cfg,
-		Env:      ws.Env,
-		Version:  version.Version,
+		ID:               ws.ID,
+		Path:             ws.Path,
+		YOLO:             ws.Cfg.Overrides().SkipPermissionRequests,
+		AllowAllCommands: ws.Cfg.Overrides().AllowAllCommands,
+		Channels:         ws.Cfg.Overrides().EnabledChannels,
+		DataDir:          cfg.Options.DataDirectory,
+		Debug:            cfg.Options.Debug,
+		Config:           cfg,
+		Env:              ws.Env,
+		Version:          version.Version,
 	}
 	if ws.Skills != nil {
 		out.Skills = skillStatesToProto(ws.Skills.States())
@@ -1097,8 +1099,10 @@ func workspaceToProto(ws *Workspace) proto.Workspace {
 func logFirstWinsMismatch(existing *Workspace, args proto.Workspace) {
 	existingCfg := existing.Cfg.Config()
 	existingYOLO := existing.Cfg.Overrides().SkipPermissionRequests
+	existingAllowAllCommands := existing.Cfg.Overrides().AllowAllCommands
 	existingChannels := existing.Cfg.Overrides().EnabledChannels
 	if existingYOLO == args.YOLO &&
+		existingAllowAllCommands == args.AllowAllCommands &&
 		existingCfg.Options.Debug == args.Debug &&
 		existingCfg.Options.DataDirectory == args.DataDir &&
 		stringSlicesEqual(existing.Env, args.Env) &&
@@ -1111,6 +1115,8 @@ func logFirstWinsMismatch(existing *Workspace, args proto.Workspace) {
 		"path", existing.Path,
 		"existing_yolo", existingYOLO,
 		"requested_yolo", args.YOLO,
+		"existing_allow_all_commands", existingAllowAllCommands,
+		"requested_allow_all_commands", args.AllowAllCommands,
 		"existing_debug", existingCfg.Options.Debug,
 		"requested_debug", args.Debug,
 		"existing_data_dir", existingCfg.Options.DataDirectory,
