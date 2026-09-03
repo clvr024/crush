@@ -62,7 +62,7 @@ jobs:
           if [[ -z "$upstream_tag" ]]; then
             upstream_tag="v0.0.0"
           fi
-          release_tag="${upstream_tag}-yy.${GITHUB_RUN_NUMBER}"
+          release_tag="${upstream_tag}+fork.${GITHUB_RUN_NUMBER}"
           git tag "$release_tag"
           git push origin "$release_tag"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
