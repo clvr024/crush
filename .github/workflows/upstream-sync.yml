@@ -30,7 +30,7 @@ jobs:
           git fetch upstream main --tags
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            if [[ -z "$(git tag --list '*-yy.*')" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch || -z "$(git tag --list '*-yy.*')" ]]; then
               echo "should_release=true" >> "$GITHUB_OUTPUT"
             else
               echo "should_release=false" >> "$GITHUB_OUTPUT"
@@ -38,6 +38,11 @@ jobs:
             exit 0
           fi
           git merge --no-edit upstream/main
+          # Keep the fork's workflows so GITHUB_TOKEN can push the merge.
+          if ! git diff --quiet HEAD^1 HEAD -- .github/workflows; then
+            git restore --source=HEAD^1 --staged --worktree -- .github/workflows
+            git commit --amend --no-edit
+          fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
 
@@ -59,7 +64,7 @@ jobs:
         id: tag
         shell: bash
         run: |
-          upstream_tag="$(git tag --list 'v[0-9]*' --sort=-version:refname | grep -v -- '-yy\.' | head -n 1)"
+          upstream_tag="$(git tag --list 'v[0-9]*' --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
           if [[ -z "$upstream_tag" ]]; then
             upstream_tag="v0.0.0"
           fi
