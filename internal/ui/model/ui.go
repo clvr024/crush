@@ -81,6 +81,10 @@ const pasteColsThreshold = 1000
 // Session details panel max height.
 const sessionDetailsMaxHeight = 20
 
+// hyperCreditsPollInterval is how often the Hyper credits balance is
+// refreshed while no session is running.
+const hyperCreditsPollInterval = 60 * time.Second
+
 // TextareaMaxHeight is the maximum height of the prompt textarea.
 const TextareaMaxHeight = 15
 
@@ -176,12 +180,16 @@ type (
 	sessionFilesUpdatesMsg struct {
 		sessionFiles []SessionFile
 	}
+
 	// creditsUpdatedMsg is sent when the remaining Hyper credits have been
 	// fetched from the API. credits is nil when the team has hypercredit
 	// display disabled.
 	creditsUpdatedMsg struct {
 		credits *int
 	}
+
+	// hyperCreditsPollMsg is sent by the Hyper credits poll timer.
+	hyperCreditsPollMsg struct{}
 )
 
 // UI represents the main user interface model.
@@ -216,6 +224,12 @@ type UI struct {
 	// skip the expensive style rebuild when switching to a provider that
 	// resolves to the same theme.
 	themeKey string
+
+	// userThemeSelected records that the user explicitly chose a theme
+	// during this session. It guards against provider-driven theme swaps
+	// discarding that choice, even in client/server mode where the
+	// config round-trip may not reflect the selection immediately.
+	userThemeSelected bool
 
 	focus uiFocusState
 	state uiState
@@ -402,14 +416,18 @@ type UI struct {
 	todoSpinner    spinner.Model
 	todoIsSpinning bool
 
+	// preThemeStyles stores the styles before a theme preview so we can revert.
+	preThemeStyles *styles.Styles
+
 	// mouse highlighting related state
 	lastClickTime time.Time
 	hoverX        int
 	hoverY        int
 
-	// hyperCredits is the remaining Hyper credits, updated after each prompt.
-	// It is nil when unknown, or when the team has hypercredit display
-	// disabled, and no balance is rendered in either case.
+	// hyperCredits is the remaining Hyper credits as last fetched from
+	// the /v1/credits endpoint. It is nil when no fetch has reported a
+	// balance yet, or when the team has hypercredit display disabled, and
+	// no balance is rendered in either case.
 	hyperCredits *int
 
 	// Prompt history for up/down navigation through previous messages.
@@ -508,6 +526,7 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 	// first model selection can correctly skip a redundant theme swap.
 	if cfg := com.Config(); cfg != nil {
 		ui.themeKey = styles.ThemeKeyForProvider(cfg.Models[config.SelectedModelTypeLarge].Provider)
+		ui.userThemeSelected = common.ThemeNameFromConfig(cfg) != ""
 	}
 
 	// Seed the yolo cache once at construction; afterwards it is kept
@@ -584,9 +603,6 @@ func (m *UI) Init() tea.Cmd {
 	if initialSession == nil {
 		cmds = append(cmds, m.loadPromptHistory())
 	}
-	if m.com.IsHyper() {
-		cmds = append(cmds, m.fetchHyperCredits())
-	}
 	// Prime the ChatGPT model catalog: a signed-in OpenAI provider
 	// whose catalog is missing (the fetch at login failed, or the
 	// credentials predate it) refills lazily, so the models dialog shows
@@ -599,6 +615,13 @@ func (m *UI) Init() tea.Cmd {
 	if cmd := m.dispatchBusyRefresh(); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
+	// The credits balance is shown from the first frame on, so fetch it
+	// right away and keep polling it while Crush sits idle. The poll runs
+	// for every provider: it is a no-op unless Hyper is selected.
+	if m.com.IsHyper() {
+		cmds = append(cmds, m.fetchHyperCredits())
+	}
+	cmds = append(cmds, m.hyperCreditsTicker())
 	cmds = append(cmds, m.checkPendingMCPAuth())
 	return tea.Batch(cmds...)
 }
@@ -917,6 +940,13 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case mcpStateChangedMsg:
 		m.mcpStates = msg.states
+		if dia := m.dialog.Dialog(dialog.MCPTogglesID); dia != nil {
+			if toggles, ok := dia.(*dialog.MCPToggles); ok {
+				for name, info := range msg.states {
+					toggles.SetItemStatus(name, mcpStatusText(info))
+				}
+			}
+		}
 		// Auto-open the MCP auth dialog if any servers need authentication.
 		if cmd := m.openMCPAuthDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -953,6 +983,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.session != nil && msg.Payload.ID == m.session.ID {
 			prevHasInProgress := hasInProgressTodo(m.session.Todos)
 			prevPillsHeight := m.pillsAreaHeight()
+			m.updateHyperCredits()
 			m.session = &msg.Payload
 			if !prevHasInProgress && hasInProgressTodo(m.session.Todos) {
 				m.todoIsSpinning = true
@@ -1045,6 +1076,8 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, handleMCPToolsEvent(m.com.Workspace, msg.Payload.Name)
 		case mcp.EventResourcesListChanged:
 			return m, handleMCPResourcesEvent(m.com.Workspace, msg.Payload.Name)
+		case mcp.EventChannelMessage:
+			return m, m.handleChannelMessage(msg.Payload)
 		}
 	case pubsub.Event[permission.PermissionRequest]:
 		if cmd := m.openPermissionsDialog(msg.Payload); cmd != nil {
@@ -1431,6 +1464,14 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case creditsUpdatedMsg:
 		m.hyperCredits = msg.credits
+	case hyperCreditsPollMsg:
+		// While a session runs every response refreshes the balance, so
+		// the poll only has to cover idle time. Re-arm it either way: the
+		// next poll may well land after the agent went idle again.
+		if m.com.IsHyper() && !m.isAgentBusy() {
+			cmds = append(cmds, m.fetchHyperCredits())
+		}
+		cmds = append(cmds, m.hyperCreditsTicker())
 	case util.InfoMsg:
 		if msg.Type == util.InfoTypeError {
 			slog.Error("Error reported", "error", msg.Msg)
@@ -2168,6 +2209,204 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 			return util.NewInfoMsg("Transparent background " + status)
 		})
 		m.dialog.CloseDialog(dialog.CommandsID)
+	case dialog.ActionSwitchTheme:
+		themeName := msg.Theme
+		newStyles, err := styles.LoadTheme(themeName)
+		if err != nil {
+			cmds = append(cmds, util.ReportError(err))
+			break
+		}
+		if err := m.com.Workspace.SetConfigField(config.ScopeGlobal, "options.tui.active_theme", themeName); err != nil {
+			if m.preThemeStyles != nil {
+				m.applyTheme(*m.preThemeStyles)
+				m.preThemeStyles = nil
+			}
+			cmds = append(cmds, util.ReportError(err))
+			break
+		}
+		m.applyTheme(newStyles)
+		m.preThemeStyles = nil
+		cmds = append(cmds, util.ReportInfo("Theme switched to "+themeName))
+		m.userThemeSelected = true
+		m.dialog.CloseDialog(dialog.ThemeID)
+	case dialog.ActionPreviewTheme:
+		newStyles, err := styles.LoadTheme(msg.Theme)
+		if err != nil {
+			break
+		}
+		if m.preThemeStyles == nil {
+			saved := m.com.Styles.Clone()
+			m.preThemeStyles = &saved
+		}
+		m.previewTheme(newStyles)
+	case dialog.ActionRevertThemePreview:
+		if m.preThemeStyles != nil {
+			m.applyTheme(*m.preThemeStyles)
+			m.preThemeStyles = nil
+		}
+		m.dialog.CloseDialog(dialog.ThemeID)
+	case dialog.ActionPreviewThemePalette:
+		newStyles, err := styles.LoadPaletteTheme(msg.Base, msg.Palette)
+		if err != nil {
+			break
+		}
+		if m.preThemeStyles == nil {
+			saved := m.com.Styles.Clone()
+			m.preThemeStyles = &saved
+		}
+		m.previewTheme(newStyles)
+	case dialog.ActionSaveThemePalette:
+		// The theme is stored under its own name; Base only identifies the
+		// built-in palette its colors are derived from.
+		themeName := msg.Name
+		if themeName == "" {
+			themeName = msg.Base
+		}
+
+		// Write the file before touching the UI so a failed save never
+		// leaves colors applied that did not reach disk.
+		savePath, err := styles.ThemePath(themeName)
+		if err != nil {
+			cmds = append(cmds, util.ReportError(err))
+			break
+		}
+		tf := &styles.ThemeFile{Base: msg.Base, Palette: msg.Palette}
+		if err := styles.SaveThemeFile(savePath, tf); err != nil {
+			cmds = append(cmds, util.ReportError(err))
+			break
+		}
+
+		// Only take over the whole UI when the saved theme is the active
+		// one (or the implicit default). Otherwise the preview backup
+		// stays intact so esc restores the user's real theme instead of
+		// leaving the edited colors applied until restart.
+		activeTheme := common.ThemeNameFromConfig(m.com.Config())
+		isActive := strings.EqualFold(activeTheme, themeName)
+		if activeTheme == "" {
+			isActive = strings.EqualFold(themeName, "charmtone-panther")
+		}
+		if isActive {
+			newStyles, err := styles.LoadTheme(themeName)
+			if err != nil {
+				cmds = append(cmds, util.ReportError(err))
+				break
+			}
+			m.applyTheme(newStyles)
+			m.preThemeStyles = nil
+		}
+		cmds = append(cmds, util.ReportInfo("Theme saved"))
+		m.dialog.CloseDialog(dialog.ThemeEditorID)
+		if td, ok := m.dialog.Dialog(dialog.ThemeID).(*dialog.Theme); ok {
+			td.RefreshThemes(themeName)
+		}
+	case dialog.ActionEditTheme:
+		m.openThemeEditorDialog(msg.Name)
+	case dialog.ActionRevertThemePalette:
+		if m.preThemeStyles != nil {
+			m.applyTheme(*m.preThemeStyles)
+			m.preThemeStyles = nil
+		}
+		m.dialog.CloseDialog(dialog.ThemeEditorID)
+	case dialog.ActionRevertOverriddenTheme:
+		// Drop any user override layered on top of the built-in: the
+		// shadowing theme file and the config palette entry.
+		if path, err := styles.FindThemeFile(msg.Name); err == nil {
+			if err := os.Remove(path); err != nil {
+				cmds = append(cmds, util.ReportError(fmt.Errorf("revert theme: %w", err)))
+				break
+			}
+		}
+		// If the reverted theme is the active one, re-apply the pristine
+		// built-in so the change is visible immediately.
+		if strings.EqualFold(common.ThemeNameFromConfig(m.com.Config()), msg.Name) {
+			if newStyles, err := styles.LoadTheme(msg.Name); err == nil {
+				m.applyTheme(newStyles)
+			}
+		}
+		cmds = append(cmds, util.ReportInfo("Reverted "+msg.Name+" to its built-in colors"))
+		m.dialog.CloseDialog(dialog.ThemeID)
+		m.openThemeDialog()
+	case dialog.ActionCreateTheme:
+		base := msg.Base
+		if base == "" {
+			base = "charmtone-panther"
+		}
+		name := msg.Name
+		exported, err := styles.ExportResolvedPalette(base)
+		if err != nil {
+			// Fall back to the default theme when the base theme is no
+			// longer resolvable (e.g. a user theme that was since deleted).
+			base = "charmtone-panther"
+			exported, err = styles.ExportResolvedPalette(base)
+			if err != nil {
+				cmds = append(cmds, util.ReportError(err))
+				break
+			}
+		}
+		savePath, err := styles.ThemePath(name)
+		if err != nil {
+			cmds = append(cmds, util.ReportError(err))
+			break
+		}
+		// ExportResolvedPalette already pins Base to the built-in root the
+		// palette was resolved from. Keep it so the new theme stays
+		// loadable even if a user theme used as the source is later
+		// deleted or renamed.
+		if err := styles.SaveThemeFile(savePath, exported); err != nil {
+			cmds = append(cmds, util.ReportError(err))
+			break
+		}
+		if err := m.com.Workspace.SetConfigField(config.ScopeGlobal, "options.tui.active_theme", name); err != nil {
+			cmds = append(cmds, util.ReportError(err))
+			break
+		}
+		cmds = append(cmds, util.ReportInfo("Created new theme: "+name))
+		m.dialog.CloseDialog(dialog.ThemeNewID)
+		m.dialog.CloseDialog(dialog.ThemeID)
+		m.openThemeEditorDialog(name)
+	case dialog.ActionRenameTheme:
+		oldName := msg.OldName
+		newName := strings.ToLower(msg.NewName)
+		oldPath, newPath, err := styles.RenameThemeFile(oldName, newName)
+		if err != nil {
+			cmds = append(cmds, util.ReportError(err))
+			break
+		}
+		cfg := m.com.Config()
+		if cfg != nil && cfg.Options != nil && cfg.Options.TUI != nil && strings.EqualFold(cfg.Options.TUI.ActiveTheme, oldName) {
+			if err := m.com.Workspace.SetConfigField(config.ScopeGlobal, "options.tui.active_theme", newName); err != nil {
+				if rollbackErr := os.Rename(newPath, oldPath); rollbackErr != nil {
+					slog.Error("Failed to roll back theme rename", "error", rollbackErr)
+				}
+				cmds = append(cmds, util.ReportError(err))
+				break
+			}
+		}
+		cmds = append(cmds, util.ReportInfo("Renamed theme "+oldName+" to "+newName))
+		m.dialog.CloseDialog(dialog.ThemeID)
+		m.openThemeDialog()
+	case dialog.ActionDeleteTheme:
+		if err := styles.DeleteThemeFile(msg.Name); err != nil {
+			cmds = append(cmds, util.ReportError(err))
+			break
+		}
+		// If the deleted theme was active, reset to the default theme.
+		if strings.EqualFold(common.ThemeNameFromConfig(m.com.Config()), msg.Name) {
+			if err := m.com.Workspace.SetConfigField(config.ScopeGlobal, "options.tui.active_theme", "charmtone-panther"); err != nil {
+				cmds = append(cmds, util.ReportError(err))
+				break
+			}
+			newStyles, err := styles.LoadTheme("charmtone-panther")
+			if err != nil {
+				cmds = append(cmds, util.ReportError(err))
+				break
+			}
+			m.applyTheme(newStyles)
+			m.preThemeStyles = nil
+		}
+		cmds = append(cmds, util.ReportInfo("Deleted theme "+msg.Name))
+		m.dialog.CloseDialog(dialog.ThemeID)
+		m.openThemeDialog()
 	case dialog.ActionToggleMouseSupport:
 		cfg := m.com.Config()
 		if cfg == nil {
@@ -2200,6 +2439,8 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 	case dialog.ActionDisableDockerMCP:
 		m.dialog.CloseDialog(dialog.CommandsID)
 		cmds = append(cmds, m.disableDockerMCP)
+	case dialog.ActionToggleMCP:
+		cmds = append(cmds, m.applyMCPToggle(msg))
 	case dialog.ActionInitializeProject:
 		if m.isAgentBusy() {
 			cmds = append(cmds, util.ReportWarn("Agent is busy, please wait before summarizing session..."))
@@ -2339,8 +2580,22 @@ func (m *UI) refreshHyperAndRetrySelect(msg dialog.ActionSelectModel) tea.Cmd {
 	}
 }
 
+// updateHyperCredits refreshes the displayed Hyper balance from the most
+// recent /v1/credits fetch. The balance is fetched on startup, polled
+// while idle and refreshed on every response during a session, so reading
+// the stored value here is enough: until the first fetch lands the
+// balance is unknown and stays hidden.
+func (m *UI) updateHyperCredits() {
+	if !m.com.IsHyper() {
+		return
+	}
+	m.hyperCredits = hyper.Balance()
+}
+
 // fetchHyperCredits returns a command that asynchronously fetches the
-// remaining Hyper credits from the API.
+// remaining Hyper credits from the /v1/credits endpoint. An expired
+// OAuth token is refreshed first so a long-running session keeps
+// reporting a balance.
 func (m *UI) fetchHyperCredits() tea.Cmd {
 	return func() tea.Msg {
 		var (
@@ -2349,7 +2604,7 @@ func (m *UI) fetchHyperCredits() tea.Cmd {
 			providerCfg config.ProviderConfig
 		)
 		getAPIKey := func() (ok bool) {
-			if cfg = m.com.Config(); cfg == nil {
+			if cfg = m.com.Config(); cfg == nil || cfg.Providers == nil {
 				return false
 			}
 			if providerCfg, ok = cfg.Providers.Get(hyper.Name); !ok {
@@ -2377,11 +2632,18 @@ func (m *UI) fetchHyperCredits() tea.Cmd {
 		defer cancel()
 		credits, err := hyper.FetchCredits(ctx, apiKey)
 		if err != nil {
-			slog.Error("Failed to fetch Hyper credits", "error", err)
+			slog.Warn("Failed to fetch Hyper credits", "error", err)
 			return nil
 		}
 		return creditsUpdatedMsg{credits: credits}
 	}
+}
+
+// hyperCreditsTicker schedules the next Hyper credits poll.
+func (m *UI) hyperCreditsTicker() tea.Cmd {
+	return tea.Tick(hyperCreditsPollInterval, func(time.Time) tea.Msg {
+		return hyperCreditsPollMsg{}
+	})
 }
 
 // restoreModelFromSession checks the last assistant message in the
@@ -2675,6 +2937,11 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			m.detailsOpen = !m.detailsOpen
 			m.updateLayoutAndSize()
 			return true
+		case key.Matches(msg, m.keyMap.Chat.ToggleSidebar):
+			if m.canToggleSidebar() {
+				cmds = append(cmds, m.toggleCompactMode())
+				return true
+			}
 		case key.Matches(msg, m.keyMap.Chat.EndFollow):
 			if m.state == uiChat && m.hasSession() {
 				if cmd := m.chat.ScrollToBottomAndSelectLast(); cmd != nil {
@@ -3362,15 +3629,15 @@ func (m *UI) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 // mouseMode determines the Bubble Tea mouse reporting mode to request for
 // the current frame. When mouse support is disabled via configuration, no
 // mouse mode is requested so the terminal emulator (or tmux) can handle
-// text selection, copy/paste, and scrolling natively. Inline editors need
-// motion events even without a button pressed (e.g. for hover/drag), so
-// they use MouseModeAllMotion; everything else only needs click/drag
-// tracking via MouseModeCellMotion.
-func mouseMode(enabled, inlineActive bool) tea.MouseMode {
+// text selection, copy/paste, and scrolling natively. Inline editors and
+// hoverable dialogs need motion events even without a button pressed (e.g.
+// for hover/drag), so they use MouseModeAllMotion; everything else only
+// needs click/drag tracking via MouseModeCellMotion.
+func mouseMode(enabled, wantsMotion bool) tea.MouseMode {
 	switch {
 	case !enabled:
 		return tea.MouseModeNone
-	case inlineActive:
+	case wantsMotion:
 		return tea.MouseModeAllMotion
 	default:
 		return tea.MouseModeCellMotion
@@ -3384,7 +3651,7 @@ func (m *UI) View() tea.View {
 	if !m.isTransparent {
 		v.BackgroundColor = m.com.Styles.Background
 	}
-	v.MouseMode = mouseMode(m.mouseEnabled, m.activeInline != nil)
+	v.MouseMode = mouseMode(m.mouseEnabled, m.activeInline != nil || m.dialog.HandlesHover())
 	v.ReportFocus = m.caps.ReportFocusEvents
 	v.WindowTitle = "crush " + home.Short(m.com.Workspace.WorkingDir())
 
@@ -3482,6 +3749,10 @@ func (m *UI) ShortHelp() []key.Binding {
 			commands,
 			k.Models,
 		)
+
+		if m.canToggleSidebar() {
+			binds = append(binds, k.Chat.ToggleSidebar)
+		}
 
 		switch m.focus {
 		case uiFocusEditor:
@@ -3603,6 +3874,9 @@ func (m *UI) FullHelp() [][]key.Binding {
 		)
 		if hasSession {
 			mainBinds = append(mainBinds, k.Chat.NewSession, k.Chat.EndFollow)
+		}
+		if m.canToggleSidebar() {
+			mainBinds = append(mainBinds, k.Chat.ToggleSidebar)
 		}
 
 		binds = append(binds, mainBinds)
@@ -3756,9 +4030,31 @@ func (m *UI) toggleCompactMode() tea.Cmd {
 		return util.ReportError(err)
 	}
 
+	var cmds []tea.Cmd
+	if m.forceCompactMode && m.focus == uiFocusSidebar {
+		// The sidebar is going away, so focus the editor again to keep key
+		// events routed somewhere useful.
+		m.sidebarScrollbarVisible = false
+		if m.activeInline != nil {
+			m.focusActiveInline(uiFocusEditor)
+		} else {
+			m.focus = uiFocusEditor
+			cmds = append(cmds, m.textarea.Focus())
+		}
+	}
+
 	m.updateLayoutAndSize()
 
-	return nil
+	return tea.Batch(cmds...)
+}
+
+// canToggleSidebar reports whether the sidebar can be shown right now, i.e.
+// a chat session is active and the terminal is large enough for the full
+// layout.
+func (m *UI) canToggleSidebar() bool {
+	return m.state == uiChat && m.hasSession() &&
+		m.width >= compactModeWidthBreakpoint &&
+		m.height >= compactModeHeightBreakpoint
 }
 
 // updateLayoutAndSize updates the layout and sizes of UI components.
@@ -4594,7 +4890,16 @@ func (m *UI) cacheSidebarLogo(width int) {
 // model from the same theme family would otherwise pay the full cost of
 // invalidating the markdown renderer cache and re-rendering the entire
 // transcript for no visible change.
+// A theme explicitly selected in the config always wins, so provider
+// changes never discard the user's choice.
 func (m *UI) applyThemeForProvider(providerID string) {
+	// A theme the user explicitly selected always wins over the
+	// per-provider default, so provider or session changes never discard
+	// their choice. The in-memory flag covers client/server mode, where
+	// the config round-trip may not surface the selection right away.
+	if m.userThemeSelected || common.ThemeNameFromConfig(m.com.Config()) != "" {
+		return
+	}
 	key := styles.ThemeKeyForProvider(providerID)
 	if key == m.themeKey {
 		return
@@ -4604,16 +4909,30 @@ func (m *UI) applyThemeForProvider(providerID string) {
 }
 
 // applyTheme replaces the active styles with the given theme, drops the
-// shared markdown renderer cache, and refreshes every component that
-// caches style data.
+// shared style caches, and refreshes every component that caches style
+// data.
 func (m *UI) applyTheme(s styles.Styles) {
 	*m.com.Styles = s
-	common.InvalidateMarkdownRendererCache()
+	common.InvalidateStyleCaches()
 	m.refreshStyles()
+	m.chat.InvalidateRenderCaches()
+}
+
+// previewTheme applies the given styles for live preview inside an open
+// theme dialog. The whole interface updates, but only the chat messages
+// currently on screen re-render; the rest of the transcript keeps its
+// cached output so browsing themes stays fast in large sessions. Off-screen
+// messages follow along when the theme is actually applied.
+func (m *UI) previewTheme(s styles.Styles) {
+	*m.com.Styles = s
+	common.InvalidateStyleCaches()
+	m.refreshStyles()
+	m.chat.InvalidateVisibleRenderCaches()
 }
 
 // refreshStyles pushes the current *m.com.Styles into every subcomponent
 // that copies or pre-renders style-dependent values at construction time.
+// Callers are responsible for invalidating chat render caches.
 func (m *UI) refreshStyles() {
 	t := m.com.Styles
 	m.header.refresh()
@@ -4632,7 +4951,11 @@ func (m *UI) refreshStyles() {
 	)
 	m.todoSpinner.Style = t.Pills.TodoSpinner
 	m.status.help.Styles = t.Help
-	m.chat.InvalidateRenderCaches()
+	if d := m.dialog.Dialog(dialog.ThemeID); d != nil {
+		if td, ok := d.(*dialog.Theme); ok {
+			td.RefreshStyles()
+		}
+	}
 }
 
 // attachSkill reads a skill's content by ID and returns it as a markdown
@@ -4659,6 +4982,62 @@ func (m *UI) attachSkill(skillID, name string) tea.Cmd {
 	}
 }
 
+// openThemeNewDialog opens the new theme naming dialog. The new theme
+// inherits its palette from the currently active theme.
+func (m *UI) openThemeNewDialog() {
+	if m.dialog.ContainsDialog(dialog.ThemeNewID) {
+		m.dialog.BringToFront(dialog.ThemeNewID)
+		return
+	}
+	base := common.ThemeNameFromConfig(m.com.Config())
+	m.dialog.OpenDialog(dialog.NewThemeNew(m.com, base))
+}
+
+// openThemeDialog opens the theme picker dialog.
+func (m *UI) openThemeDialog() {
+	if m.dialog.ContainsDialog(dialog.ThemeID) {
+		m.dialog.BringToFront(dialog.ThemeID)
+		return
+	}
+	themeDialog := dialog.NewTheme(m.com)
+	m.dialog.OpenDialog(themeDialog)
+}
+
+// openThemeEditorDialog opens the theme editor dialog for the given theme.
+// An empty themeName edits the currently active theme.
+func (m *UI) openThemeEditorDialog(themeName string) {
+	if m.dialog.ContainsDialog(dialog.ThemeEditorID) {
+		m.dialog.BringToFront(dialog.ThemeEditorID)
+		return
+	}
+	themeDialog := dialog.NewThemeEditor(m.com, themeName)
+	m.dialog.OpenDialog(themeDialog)
+}
+
+// ensureSession makes sure a session is active, creating one if none is. It
+// returns a command that loads the freshly created session (nil when a session
+// already existed) and an error if creation failed. It mutates UI state, so
+// callers must run on the Update goroutine.
+func (m *UI) ensureSession() (tea.Cmd, error) {
+	if m.hasSession() {
+		return nil, nil
+	}
+	newSession, err := m.com.Workspace.CreateSession(context.Background(), "New Session")
+	if err != nil {
+		return nil, err
+	}
+	if m.forceCompactMode {
+		m.isCompact = true
+	}
+	var cmd tea.Cmd
+	if newSession.ID != "" {
+		m.session = &newSession
+		cmd = m.loadSession(newSession.ID)
+	}
+	m.setState(uiChat, m.focus)
+	return cmd, nil
+}
+
 // sendMessage sends a message with the given content and attachments.
 func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.Cmd {
 	return m.sendMessageInternal(content, false, attachments...)
@@ -4677,19 +5056,12 @@ func (m *UI) sendMessageInternal(content string, hidden bool, attachments ...mes
 	m.setPlanReadyPending("")
 
 	var cmds []tea.Cmd
-	if !m.hasSession() {
-		newSession, err := m.com.Workspace.CreateSession(context.Background(), "New Session")
-		if err != nil {
-			return util.ReportError(err)
-		}
-		if m.forceCompactMode {
-			m.isCompact = true
-		}
-		if newSession.ID != "" {
-			m.session = &newSession
-			cmds = append(cmds, m.loadSession(newSession.ID))
-		}
-		m.setState(uiChat, m.focus)
+	loadCmd, err := m.ensureSession()
+	if err != nil {
+		return util.ReportError(err)
+	}
+	if loadCmd != nil {
+		cmds = append(cmds, loadCmd)
 	}
 
 	ctx := context.Background()
@@ -4731,6 +5103,53 @@ func (m *UI) sendMessageInternal(content string, hidden bool, attachments ...mes
 		return agentRunSubmittedMsg{}
 	})
 	return tea.Batch(cmds...)
+}
+
+// handleChannelMessage injects a channel event pushed by an MCP server into a
+// session so the agent reacts to it on its next turn. The rendered <channel>
+// element is already validated and escaped by the mcp package. If no session is
+// active yet, one is created so a pushed event is never silently dropped; if the
+// agent is busy, AgentRun enqueues the message and it is picked up on the next
+// step.
+//
+// Injection is skipped entirely when the workspace routes channel events
+// itself (client/server mode): the server injects each event exactly once,
+// and injecting here as well would duplicate the turn once per attached
+// client. The injected turn still reaches this client through the normal
+// session/message event stream.
+func (m *UI) handleChannelMessage(ev mcp.Event) tea.Cmd {
+	if m.com.Workspace.RoutesChannelEvents() {
+		return nil
+	}
+	if ev.ChannelMessage == "" || !m.com.Workspace.AgentIsReady() {
+		return nil
+	}
+	loadCmd, err := m.ensureSession()
+	if err != nil {
+		slog.Debug("Failed to create session for channel message", "error", err)
+		return nil
+	}
+	if !m.hasSession() {
+		slog.Debug("Channel message dropped: no active session after ensureSession", "channel", ev.Name)
+		return loadCmd
+	}
+	// The coordinator sets the channel binding during the turn
+	// (syncSessionChannel), so there is no need to write it here —
+	// doing so would race with the coordinator's own write and
+	// publish a duplicate session update.
+	sessionID := m.session.ID
+	channel := ev.Name
+	content := ev.ChannelMessage
+	runCmd := func() tea.Msg {
+		if err := m.com.Workspace.AgentRunChannel(context.Background(), channel, sessionID, content); err != nil {
+			slog.Debug("Failed to inject channel message", "error", err, "session", sessionID)
+		}
+		return nil
+	}
+	if loadCmd != nil {
+		return tea.Batch(loadCmd, runCmd)
+	}
+	return runCmd
 }
 
 // runShellCommand executes a shell command server-side without triggering
@@ -4909,10 +5328,20 @@ func (m *UI) openDialog(id string) tea.Cmd {
 		if cmd := m.openNotificationsDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case dialog.MCPTogglesID:
+		if cmd := m.openMCPTogglesDialog(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case dialog.FilePickerID:
 		if cmd := m.openFilesDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case dialog.ThemeID:
+		m.openThemeDialog()
+	case dialog.ThemeNewID:
+		m.openThemeNewDialog()
+	case dialog.ThemeEditorID:
+		m.openThemeEditorDialog("")
 	case dialog.QuitID:
 		if cmd := m.openQuitDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -5251,6 +5680,10 @@ func (m *UI) handleAgentNotification(n notify.Notification) tea.Cmd {
 			Title:   "Crush is waiting...",
 			Message: fmt.Sprintf("Agent's turn completed in \"%s\"", n.SessionTitle),
 		}))
+		// Show what the stored balance says right away, and fetch again:
+		// the refresh for the turn's last response is only kicked off once
+		// its request finishes, so it may still be in flight here.
+		m.updateHyperCredits()
 		if m.com.IsHyper() {
 			cmds = append(cmds, m.fetchHyperCredits())
 		}

@@ -72,9 +72,9 @@ func UpdateProviders(pathOrURL string) error {
 	return nil
 }
 
-// resolveHyperAPIKey returns the Hyper API key from the environment or
+// ResolveHyperAPIKey returns the Hyper API key from the environment or
 // the raw config value. The env var takes precedence.
-func resolveHyperAPIKey(cfg *Config) string {
+func ResolveHyperAPIKey(cfg *Config) string {
 	if key := os.Getenv("HYPER_API_KEY"); key != "" {
 		return key
 	}
@@ -104,7 +104,7 @@ func UpdateHyper(pathOrURL string) error {
 	case strings.HasPrefix(pathOrURL, "http://") || strings.HasPrefix(pathOrURL, "https://"):
 		client := realHyperClient{
 			baseURL:    pathOrURL,
-			resolveKey: func() string { return resolveHyperAPIKey(nil) },
+			resolveKey: func() string { return ResolveHyperAPIKey(nil) },
 		}
 		var err error
 		provider, err = client.Get(context.Background(), "")
@@ -133,6 +133,15 @@ var (
 	catwalkSyncer = &catwalkSync{}
 	hyperSyncer   = &hyperSync{}
 )
+
+// CatwalkUpdated reports whether the Catwalk provider catalog was
+// refreshed with new data during this run's catalog fetch. The fetch
+// runs once per process, before the first call to Providers returns, so
+// the result is stable afterwards. Callers use it to renew catalogs that
+// shadow Catwalk's, such as the ChatGPT model catalog.
+func CatwalkUpdated() bool {
+	return catwalkSyncer.Updated()
+}
 
 // Providers returns the list of providers, taking into account cached results
 // and whether or not auto update is enabled.
@@ -198,7 +207,7 @@ func Providers(cfg *Config, opts ...HyperTokenRefresher) ([]catwalk.Provider, er
 			}
 			hyperSyncer.Init(realHyperClient{
 				baseURL:      hyper.BaseURL(),
-				resolveKey:   func() string { return resolveHyperAPIKey(cfgSnapshot) },
+				resolveKey:   func() string { return ResolveHyperAPIKey(cfgSnapshot) },
 				refreshToken: refresher,
 			}, path, autoupdate)
 

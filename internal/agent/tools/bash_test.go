@@ -117,7 +117,7 @@ func (m *recordingPermissionService) SubscribeNotifications(ctx context.Context)
 func newBashToolForTest(workingDir string) fantasy.AgentTool {
 	permissions := &mockBashPermissionService{Broker: pubsub.NewBroker[permission.PermissionRequest]()}
 	attribution := &config.Attribution{TrailerStyle: config.TrailerStyleNone}
-	return NewBashTool(permissions, workingDir, attribution, "test-model", false)
+	return NewBashTool(permissions, workingDir, workingDir, attribution, "test-model", false)
 }
 
 func newBashToolWithRecordingPerms(workingDir string, allow bool) (fantasy.AgentTool, *recordingPermissionService) {
@@ -126,7 +126,7 @@ func newBashToolWithRecordingPerms(workingDir string, allow bool) (fantasy.Agent
 		allow:  allow,
 	}
 	attribution := &config.Attribution{TrailerStyle: config.TrailerStyleNone}
-	return NewBashTool(perms, workingDir, attribution, "test-model", false), perms
+	return NewBashTool(perms, workingDir, workingDir, attribution, "test-model", false), perms
 }
 
 func TestBashTool_ChainedCommandsRequirePermission(t *testing.T) {
@@ -172,7 +172,7 @@ func TestBashTool_AllowAllCommandsDisablesBlockList(t *testing.T) {
 	workingDir := t.TempDir()
 	permissions := &mockBashPermissionService{Broker: pubsub.NewBroker[permission.PermissionRequest]()}
 	attribution := &config.Attribution{TrailerStyle: config.TrailerStyleNone}
-	tool := NewBashTool(permissions, workingDir, attribution, "test-model", true)
+	tool := NewBashTool(permissions, workingDir, workingDir, attribution, "test-model", true)
 	ctx := context.WithValue(context.Background(), SessionIDContextKey, "test-session")
 
 	resp := runBashTool(t, tool, ctx, BashParams{
@@ -207,7 +207,7 @@ func TestTruncateOutputValidUTF8(t *testing.T) {
 	// MaxOutputLength so TruncateOutput must truncate it.
 	content := strings.Repeat("你好世界", MaxOutputLength)
 
-	out := TruncateOutput(content)
+	out := TruncateOutput(content, t.TempDir())
 	require.True(t, utf8.ValidString(out), "truncated output must stay valid UTF-8")
 	require.Contains(t, out, "lines truncated")
 }
@@ -215,7 +215,7 @@ func TestTruncateOutputValidUTF8(t *testing.T) {
 func TestTruncateOutputShortContent(t *testing.T) {
 	t.Parallel()
 	content := "short output"
-	require.Equal(t, content, TruncateOutput(content))
+	require.Equal(t, content, TruncateOutput(content, t.TempDir()))
 }
 
 func TestTruncateOutputEmoji(t *testing.T) {
@@ -223,7 +223,7 @@ func TestTruncateOutputEmoji(t *testing.T) {
 	// Emoji with ZWJ sequences should not be split.
 	content := strings.Repeat("👨‍👩‍👧‍👦", MaxOutputLength)
 
-	out := TruncateOutput(content)
+	out := TruncateOutput(content, t.TempDir())
 	require.True(t, utf8.ValidString(out), "truncated output must stay valid UTF-8")
 	require.Contains(t, out, "lines truncated")
 }

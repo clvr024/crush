@@ -3,6 +3,7 @@ package config
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -267,6 +268,52 @@ type MCPConfig struct {
 	// OAuthToken is the persisted OAuth token for this server. It is
 	// managed internally and stored in the global data config.
 	OAuthToken *oauth.Token `json:"oauth_token,omitempty" jsonschema:"-"`
+
+	// ChannelEnabled enables an MCP server as a channel directly from config,
+	// equivalent to passing its name via --channels on the CLI. This lets
+	// channels be declared persistently in crush.json without needing a CLI
+	// flag on every launch.
+	ChannelEnabled bool `json:"channel_enabled,omitempty" jsonschema:"description=Enable this MCP server as a channel (equivalent to --channels),default=false"`
+
+	// ChannelReply, when set on a server enabled as a channel, makes Crush
+	// route the final assistant response of every turn that originated from
+	// this channel back through one of the server's own tools, so a message
+	// received on the channel gets a reply on the channel even when the
+	// model only produced terminal output.
+	ChannelReply *MCPChannelReply `json:"channel_reply,omitempty" jsonschema:"description=Automatically route replies for turns originating from this channel back through one of the server's tools"`
+}
+
+// MCPChannelReply configures deterministic reply routing for an MCP server
+// acting as a channel: which of the server's tools deliver a reply for
+// direct and group pushes, and how the reply text and target are mapped
+// onto tool arguments.
+type MCPChannelReply struct {
+	// User routes replies to direct (person-to-person) channel pushes.
+	User *MCPChannelReplyRoute `json:"user,omitempty" jsonschema:"description=Reply route for direct messages"`
+	// Group routes replies to group channel pushes. It is preferred over
+	// User when the push carries the group route's meta attribute.
+	Group *MCPChannelReplyRoute `json:"group,omitempty" jsonschema:"description=Reply route for group messages"`
+	// MessageParam is the tool argument that receives the reply text.
+	MessageParam string `json:"message_param,omitempty" jsonschema:"description=Tool argument name that receives the reply text,default=message"`
+	// SuppressTools lists additional tool names (beyond the two route
+	// tools) that count as the model having already replied on the channel
+	// during the turn, e.g. an operator-shortcut send tool.
+	SuppressTools []string `json:"suppress_tools,omitempty" jsonschema:"description=Additional tool names that suppress the automatic reply when the model already called one of them during the turn,example=send"`
+}
+
+// MCPChannelReplyRoute maps one kind of inbound channel push onto the MCP
+// tool call that delivers a reply to it.
+type MCPChannelReplyRoute struct {
+	// Tool is the MCP tool (bare name, without the mcp_<server>_ prefix)
+	// invoked to deliver the reply.
+	Tool string `json:"tool" jsonschema:"required,description=MCP tool name that sends the reply,example=send_message_to_user"`
+	// TargetParam is the tool argument that receives the reply target
+	// (recipient or group ID).
+	TargetParam string `json:"target_param" jsonschema:"required,description=Tool argument name that receives the reply target,example=user_id"`
+	// TargetMeta is the <channel> meta attribute whose value identifies
+	// the reply target. Defaults to "sender" for the user route and
+	// "group" for the group route.
+	TargetMeta string `json:"target_meta,omitempty" jsonschema:"description=Channel meta attribute carrying the reply target; defaults to sender (user route) or group (group route)"`
 }
 
 // isOrphanedToken reports whether this entry is a leftover OAuth token
@@ -288,11 +335,9 @@ type LSPConfig struct {
 }
 
 type TUIOptions struct {
-	CompactMode bool   `json:"compact_mode,omitempty" jsonschema:"description=Enable compact mode for the TUI interface,default=false"`
-	DiffMode    string `json:"diff_mode,omitempty" jsonschema:"description=Diff mode for the TUI interface,enum=unified,enum=split"`
-	// Here we can add themes later or any TUI related options
-	//
-
+	CompactMode bool        `json:"compact_mode,omitempty" jsonschema:"description=Enable compact mode for the TUI interface,default=false"`
+	DiffMode    string      `json:"diff_mode,omitempty" jsonschema:"description=Diff mode for the TUI interface,enum=unified,enum=split"`
+	ActiveTheme string      `json:"active_theme,omitempty" jsonschema:"description=Name of the currently active theme,default=charmtone-panther,example=charmtone-panther,example=gruvbox-dark"`
 	Completions Completions `json:"completions,omitzero" jsonschema:"description=Completions UI options"`
 	Transparent *bool       `json:"transparent,omitempty" jsonschema:"description=Enable transparent background for the TUI interface,default=false"`
 	Scrollbar   string      `json:"scrollbar,omitempty" jsonschema:"description=Chat scrollbar visibility,enum=default,enum=always,enum=never,default=default"`
@@ -305,6 +350,37 @@ type TUIOptions struct {
 // without unwrapping either.
 func (t *TUIOptions) IsTransparent() bool {
 	return t != nil && t.Transparent != nil && *t.Transparent
+}
+
+// UnmarshalJSON tolerates the legacy string form of the "theme" field.
+// Older Crush builds stored the selected theme as `"theme":
+// "gruvbox-dark"`. When that string is encountered it is promoted to the
+// active theme name so existing configs keep loading.
+func (t *TUIOptions) UnmarshalJSON(data []byte) error {
+	type tuiOptionsAlias TUIOptions
+	var loose struct {
+		tuiOptionsAlias
+		Theme json.RawMessage `json:"theme"`
+	}
+	if err := json.Unmarshal(data, &loose); err != nil {
+		return err
+	}
+	*t = TUIOptions(loose.tuiOptionsAlias)
+	if len(loose.Theme) == 0 || string(loose.Theme) == "null" {
+		return nil
+	}
+
+	var legacyName string
+	if err := json.Unmarshal(loose.Theme, &legacyName); err != nil {
+		// Legacy inline theme maps are ignored now that files are the only
+		// palette source, but they must remain loadable during migration.
+		var legacyThemes map[string]json.RawMessage
+		return json.Unmarshal(loose.Theme, &legacyThemes)
+	}
+	if legacyName != "" && t.ActiveTheme == "" {
+		t.ActiveTheme = legacyName
+	}
+	return nil
 }
 
 // Completions defines options for the completions UI.
