@@ -539,11 +539,11 @@ func (w *ClientWorkspace) WorkingDir() string {
 	return w.cached().Path
 }
 
-// GitBranch always returns an empty string. In client/server mode the
-// workspace may live on a remote machine, and the server does not currently
-// expose git metadata, so the branch cannot be resolved on the client side.
-func (w *ClientWorkspace) GitBranch() string {
-	return ""
+// GitBranch asks the server for the branch checked out in the workspace's
+// working directory. Callers keep this off the render path; the TUI polls it
+// on a ticker and renders from its own state.
+func (w *ClientWorkspace) GitBranch(ctx context.Context) (string, error) {
+	return w.client.GitBranch(ctx, w.workspaceID())
 }
 
 func (w *ClientWorkspace) Resolver() config.VariableResolver {
