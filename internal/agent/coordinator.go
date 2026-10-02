@@ -381,7 +381,10 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	channel := ChannelFromContext(ctx)
 	c.syncSessionChannel(ctx, sessionID, channel)
 	run := func() (*fantasy.AgentResult, error) {
-		return agent.Run(ctx, SessionAgentCall{
+		// Fresh loop detector per turn: repetition history must not
+		// leak across turns, sessions, or retries of the same prompt.
+		turnCtx := WithLoopDetector(ctx, NewLoopDetector(0))
+		return agent.Run(turnCtx, SessionAgentCall{
 			SessionID:         sessionID,
 			RunID:             runID,
 			Channel:           channel,

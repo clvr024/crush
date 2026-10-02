@@ -52,6 +52,18 @@ func (h *hookedTool) SetProviderOptions(opts fantasy.ProviderOptions) {
 }
 
 func (h *hookedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	// Loop detection runs before hooks: it guards what the model
+	// actually emitted, and a blocked call never reaches hooks,
+	// permission prompts, or the inner tool.
+	if detector, ok := loopDetectorFromContext(ctx); ok {
+		if blocked, message := detector.CheckAndRecord(call.Name, call.Input); blocked {
+			slog.Debug("Loop detector blocked repeated tool call", "tool", call.Name)
+			resp := fantasy.NewTextErrorResponse(message)
+			resp.Metadata = fmt.Sprintf(`{"loop_detector":{"blocked":true,"tool":%q}}`, call.Name)
+			return resp, nil
+		}
+	}
+
 	sessionID := tools.GetSessionFromContext(ctx)
 	result, err := h.runner.Run(ctx, hooks.EventPreToolUse, sessionID, call.Name, call.Input)
 	if err != nil {
