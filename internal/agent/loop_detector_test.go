@@ -44,7 +44,7 @@ func TestLoopDetector_DifferentArgumentsDoNotTrigger(t *testing.T) {
 	}
 }
 
-func TestLoopDetector_InterleavedCallsBreakTheChain(t *testing.T) {
+func TestLoopDetector_InterleavedCallsStillDetectedAsOscillation(t *testing.T) {
 	t.Parallel()
 
 	d := NewLoopDetector(3)
@@ -53,13 +53,74 @@ func TestLoopDetector_InterleavedCallsBreakTheChain(t *testing.T) {
 	require.False(t, blocked)
 	blocked, _ = d.CheckAndRecord("view", loopTestViewArgs)
 	require.False(t, blocked)
-	// A different guarded call breaks the consecutive chain.
+	// A different guarded call breaks the consecutive chain, but the
+	// oscillation window still sees 3 identical views.
+	blocked, _ = d.CheckAndRecord("grep", `{"pattern":"foo"}`)
+	require.False(t, blocked)
+	blocked, msg := d.CheckAndRecord("view", loopTestViewArgs)
+	require.True(t, blocked, "3rd identical view within the window should be blocked even though interleaved")
+	require.Contains(t, msg, "Loop detected")
+}
+
+func TestLoopDetector_OscillationAcrossTwoCalls(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(3)
+	grepArgs := `{"pattern":"foo"}`
+
+	// A, B, A, B, A: the 3rd A trips the oscillation detector.
+	sequence := []struct {
+		tool string
+		args string
+		want bool
+	}{
+		{"view", loopTestViewArgs, false},
+		{"grep", grepArgs, false},
+		{"view", loopTestViewArgs, false},
+		{"grep", grepArgs, false},
+		{"view", loopTestViewArgs, true},
+	}
+	for i, s := range sequence {
+		blocked, _ := d.CheckAndRecord(s.tool, s.args)
+		require.Equal(t, s.want, blocked, "call %d (%s)", i+1, s.tool)
+	}
+}
+
+func TestLoopDetector_OscillationWindowExpires(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(3)
+
+	blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
+	require.False(t, blocked)
+	for i := 0; i < 6; i++ {
+		blocked, _ = d.CheckAndRecord("grep", fmt.Sprintf(`{"pattern":"p%d"}`, i))
+		require.False(t, blocked)
+	}
+	blocked, _ = d.CheckAndRecord("view", loopTestViewArgs)
+	require.False(t, blocked, "the first view aged out of the 6-call window")
+}
+
+func TestLoopDetector_OscillationResetsOnMutatingCall(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(3)
+
+	blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
+	require.False(t, blocked)
 	blocked, _ = d.CheckAndRecord("grep", `{"pattern":"foo"}`)
 	require.False(t, blocked)
 	blocked, _ = d.CheckAndRecord("view", loopTestViewArgs)
 	require.False(t, blocked)
+	// A mutating call resets the whole history.
+	blocked, _ = d.CheckAndRecord("edit", `{"file_path":"main.go"}`)
+	require.False(t, blocked)
 	blocked, _ = d.CheckAndRecord("view", loopTestViewArgs)
-	require.False(t, blocked, "chain was broken by grep, so this is only the 2nd consecutive view")
+	require.False(t, blocked)
+	blocked, _ = d.CheckAndRecord("grep", `{"pattern":"foo"}`)
+	require.False(t, blocked)
+	blocked, _ = d.CheckAndRecord("view", loopTestViewArgs)
+	require.False(t, blocked, "only the 2nd view since the reset")
 }
 
 func TestLoopDetector_MutatingToolResetsHistory(t *testing.T) {

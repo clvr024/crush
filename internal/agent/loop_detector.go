@@ -18,6 +18,11 @@ const defaultLoopMaxRepeats = 3
 // It only needs to cover a few multiples of the repeat threshold.
 const loopDetectorHistorySize = 10
 
+// oscillationWindowSize is how many recent guarded calls are scanned
+// for non-consecutive repetition of the same call (e.g. view A, grep B,
+// view A, ...). It must stay larger than the repeat threshold.
+const oscillationWindowSize = 6
+
 // loopDetectorContextKey is the context key carrying the current turn's
 // LoopDetector, installed by the coordinator.
 type loopDetectorContextKey struct{}
@@ -79,22 +84,41 @@ func (d *LoopDetector) CheckAndRecord(toolName, rawArgs string) (blocked bool, m
 	}
 
 	hash := hashToolArgs(rawArgs)
-	repeats := 1
-	for i := len(d.recentCalls) - 1; i >= 0; i-- {
-		if d.recentCalls[i].toolName == toolName && d.recentCalls[i].argsHash == hash {
-			repeats++
-		} else {
-			break
-		}
-	}
-
 	d.recentCalls = append(d.recentCalls, toolCallRecord{toolName: toolName, argsHash: hash})
 	if len(d.recentCalls) > loopDetectorHistorySize {
 		d.recentCalls = d.recentCalls[len(d.recentCalls)-loopDetectorHistorySize:]
 	}
 
-	if repeats >= d.maxRepeats {
-		return true, loopWarning(toolName, repeats)
+	same := func(r toolCallRecord) bool {
+		return r.toolName == toolName && r.argsHash == hash
+	}
+
+	// Consecutive identical calls.
+	consecutive := 0
+	for i := len(d.recentCalls) - 1; i >= 0; i-- {
+		if !same(d.recentCalls[i]) {
+			break
+		}
+		consecutive++
+	}
+	if consecutive >= d.maxRepeats {
+		return true, loopWarning(toolName, consecutive)
+	}
+
+	// Oscillation: the same call recurring within a window, even with
+	// other calls interleaved.
+	window := d.recentCalls
+	if len(window) > oscillationWindowSize {
+		window = window[len(window)-oscillationWindowSize:]
+	}
+	total := 0
+	for _, r := range window {
+		if same(r) {
+			total++
+		}
+	}
+	if total >= d.maxRepeats {
+		return true, loopWarning(toolName, total)
 	}
 	return false, ""
 }
@@ -121,7 +145,7 @@ func hashToolArgs(args string) string {
 // alternatives instead of just refusing.
 func loopWarning(toolName string, repeats int) string {
 	return fmt.Sprintf(
-		"Loop detected: you have called '%s' with identical arguments %d times in a row. "+
+		"Loop detected: you have called '%s' with identical arguments %d times recently. "+
 			"This call was blocked to prevent an infinite loop. Do not call '%s' with the same arguments again. "+
 			"If you are searching for code, use 'grep' with a specific pattern or the LSP tools "+
 			"('lsp_definition', 'lsp_symbols', 'references') instead of re-reading the same region. "+
