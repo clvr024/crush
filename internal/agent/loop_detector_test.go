@@ -15,7 +15,7 @@ const loopTestViewArgs = `{"file_path":"main.go","offset":0,"limit":100}`
 func TestLoopDetector_BlocksOnConsecutiveIdenticalCalls(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 
 	blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
 	require.False(t, blocked, "first call should pass")
@@ -36,7 +36,7 @@ func TestLoopDetector_BlocksOnConsecutiveIdenticalCalls(t *testing.T) {
 func TestLoopDetector_DifferentArgumentsDoNotTrigger(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 	for i := 0; i < 10; i++ {
 		args := fmt.Sprintf(`{"file_path":"main.go","offset":%d,"limit":100}`, i*100)
 		blocked, _ := d.CheckAndRecord("view", args)
@@ -47,7 +47,7 @@ func TestLoopDetector_DifferentArgumentsDoNotTrigger(t *testing.T) {
 func TestLoopDetector_InterleavedCallsStillDetectedAsOscillation(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 
 	blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
 	require.False(t, blocked)
@@ -65,7 +65,7 @@ func TestLoopDetector_InterleavedCallsStillDetectedAsOscillation(t *testing.T) {
 func TestLoopDetector_OscillationAcrossTwoCalls(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 	grepArgs := `{"pattern":"foo"}`
 
 	// A, B, A, B, A: the 3rd A trips the oscillation detector.
@@ -89,7 +89,7 @@ func TestLoopDetector_OscillationAcrossTwoCalls(t *testing.T) {
 func TestLoopDetector_ThreeCycleDetected(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 	grepArgs := `{"pattern":"foo"}`
 	lsArgs := `{"path":"."}`
 
@@ -119,7 +119,7 @@ func TestLoopDetector_ThreeCycleDetected(t *testing.T) {
 func TestLoopDetector_OldCallsAgeOutOfHistory(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 
 	blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
 	require.False(t, blocked)
@@ -139,7 +139,7 @@ func TestLoopDetector_OldCallsAgeOutOfHistory(t *testing.T) {
 func TestLoopDetector_OscillationResetsOnMutatingCall(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 
 	blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
 	require.False(t, blocked)
@@ -161,7 +161,7 @@ func TestLoopDetector_OscillationResetsOnMutatingCall(t *testing.T) {
 func TestLoopDetector_MutatingToolResetsHistory(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 
 	blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
 	require.False(t, blocked)
@@ -183,7 +183,7 @@ func TestLoopDetector_MutatingToolResetsHistory(t *testing.T) {
 func TestLoopDetector_UnguardedToolsAreNeverBlocked(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 	for _, tool := range []string{"bash", "edit", "write", "todos", "agent", "question"} {
 		for i := 0; i < 6; i++ {
 			blocked, _ := d.CheckAndRecord(tool, `{"same":"args"}`)
@@ -195,7 +195,7 @@ func TestLoopDetector_UnguardedToolsAreNeverBlocked(t *testing.T) {
 func TestLoopDetector_CustomThreshold(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(2)
+	d := NewLoopDetector(2, 0)
 
 	blocked, _ := d.CheckAndRecord("ls", `{"path":"."}`)
 	require.False(t, blocked)
@@ -203,10 +203,24 @@ func TestLoopDetector_CustomThreshold(t *testing.T) {
 	require.True(t, blocked, "custom threshold of 2 should block the 2nd identical call")
 }
 
+func TestLoopDetector_DefaultThresholdIsFour(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(0, 0)
+
+	for i := 0; i < 3; i++ {
+		blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
+		require.False(t, blocked, "call %d should pass with default threshold 4", i+1)
+	}
+	blocked, msg := d.CheckAndRecord("view", loopTestViewArgs)
+	require.True(t, blocked, "4th identical call should be blocked with default threshold 4")
+	require.Contains(t, msg, "4 times")
+}
+
 func TestLoopDetector_ConcurrentAccess(t *testing.T) {
 	t.Parallel()
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -227,7 +241,7 @@ func TestLoopDetector_ContextRoundTrip(t *testing.T) {
 	_, ok := loopDetectorFromContext(t.Context())
 	require.False(t, ok, "empty context should carry no detector")
 
-	d := NewLoopDetector(3)
+	d := NewLoopDetector(3, 0)
 	ctx := WithLoopDetector(t.Context(), d)
 	got, ok := loopDetectorFromContext(ctx)
 	require.True(t, ok)
@@ -255,7 +269,7 @@ func TestHookedTool_LoopDetectorBlocksRepeatedCalls(t *testing.T) {
 	runner := newRunner(t, `exit 0`) // no hooks configured effectively
 	tool := newHookedTool(inner, runner)
 
-	ctx := WithLoopDetector(t.Context(), NewLoopDetector(3))
+	ctx := WithLoopDetector(t.Context(), NewLoopDetector(3, 0))
 	call := fantasy.ToolCall{ID: "call-1", Name: "view", Input: loopTestViewArgs}
 
 	resp, err := tool.Run(ctx, call)
@@ -283,7 +297,7 @@ func TestHookedTool_LoopDetectorResetsOnMutatingCall(t *testing.T) {
 	viewTool := newHookedTool(inner, runner)
 	editTool := newHookedTool(edit, runner)
 
-	ctx := WithLoopDetector(t.Context(), NewLoopDetector(3))
+	ctx := WithLoopDetector(t.Context(), NewLoopDetector(3, 0))
 	viewCall := fantasy.ToolCall{ID: "v", Name: "view", Input: loopTestViewArgs}
 	editCall := fantasy.ToolCall{ID: "e", Name: "edit", Input: `{"file_path":"main.go"}`}
 

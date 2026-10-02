@@ -8,16 +8,8 @@ import (
 	"sync"
 
 	"github.com/charmbracelet/crush/internal/agent/tools"
+	"github.com/charmbracelet/crush/internal/config"
 )
-
-// defaultLoopMaxRepeats is the number of consecutive identical read-only
-// tool calls that trips the circuit breaker.
-const defaultLoopMaxRepeats = 3
-
-// loopDetectorHistorySize caps how many recent tool calls are retained.
-// Recurrence is counted over this whole history, so it also bounds how
-// far back the detector looks.
-const loopDetectorHistorySize = 10
 
 // loopDetectorContextKey is the context key carrying the current turn's
 // LoopDetector, installed by the coordinator.
@@ -37,6 +29,7 @@ type loopDetectorContextKey struct{}
 type LoopDetector struct {
 	mu          sync.Mutex
 	maxRepeats  int
+	maxHistory  int
 	recentCalls []toolCallRecord
 }
 
@@ -47,13 +40,21 @@ type toolCallRecord struct {
 }
 
 // NewLoopDetector returns a LoopDetector that blocks a guarded tool call
-// once it has been issued maxRepeats times consecutively with identical
-// arguments. A non-positive maxRepeats selects the default threshold.
-func NewLoopDetector(maxRepeats int) *LoopDetector {
+// once the identical (tool, arguments) signature has been issued
+// maxRepeats times within the retained history. Non-positive maxRepeats
+// or historySize select the configured defaults
+// (config.DefaultLoopMaxRepeats, config.DefaultLoopHistorySize).
+func NewLoopDetector(maxRepeats, historySize int) *LoopDetector {
 	if maxRepeats <= 0 {
-		maxRepeats = defaultLoopMaxRepeats
+		maxRepeats = config.DefaultLoopMaxRepeats
 	}
-	return &LoopDetector{maxRepeats: maxRepeats}
+	if historySize <= 0 {
+		historySize = config.DefaultLoopHistorySize
+	}
+	if historySize < maxRepeats {
+		historySize = maxRepeats
+	}
+	return &LoopDetector{maxRepeats: maxRepeats, maxHistory: historySize}
 }
 
 // WithLoopDetector installs d into ctx for the current turn.
@@ -85,8 +86,8 @@ func (d *LoopDetector) CheckAndRecord(toolName, rawArgs string) (blocked bool, m
 
 	hash := hashToolArgs(rawArgs)
 	d.recentCalls = append(d.recentCalls, toolCallRecord{toolName: toolName, argsHash: hash})
-	if len(d.recentCalls) > loopDetectorHistorySize {
-		d.recentCalls = d.recentCalls[len(d.recentCalls)-loopDetectorHistorySize:]
+	if len(d.recentCalls) > d.maxHistory {
+		d.recentCalls = d.recentCalls[len(d.recentCalls)-d.maxHistory:]
 	}
 
 	same := func(r toolCallRecord) bool {
