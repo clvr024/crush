@@ -25,11 +25,13 @@ func newHookedTool(inner fantasy.AgentTool, runner *hooks.Runner) *hookedTool {
 }
 
 // wrapToolsWithHooks returns a tool slice with each entry wrapped in a
-// hookedTool. Returns the original slice unchanged when runner is nil or
-// when isSubAgent is true — sub-agents never fire hooks, the top-level
-// invocation of the sub-agent tool itself is wrapped on the caller's side.
+// hookedTool. Only the top-level agent is wrapped: sub-agents never
+// fire hooks, and the top-level invocation of the sub-agent tool
+// itself is wrapped on the caller's side. The runner may be nil when
+// no PreToolUse hooks are configured; the wrapper still runs loop
+// detection in that case.
 func wrapToolsWithHooks(tools []fantasy.AgentTool, runner *hooks.Runner, isSubAgent bool) []fantasy.AgentTool {
-	if runner == nil || isSubAgent {
+	if isSubAgent {
 		return tools
 	}
 	out := make([]fantasy.AgentTool, len(tools))
@@ -62,6 +64,13 @@ func (h *hookedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.To
 			resp.Metadata = fmt.Sprintf(`{"loop_detector":{"blocked":true,"tool":%q}}`, call.Name)
 			return resp, nil
 		}
+	}
+
+	// Without PreToolUse hooks configured there is no runner; the
+	// call goes straight to the inner tool. Loop detection above
+	// still applies.
+	if h.runner == nil {
+		return h.inner.Run(ctx, call)
 	}
 
 	sessionID := tools.GetSessionFromContext(ctx)
