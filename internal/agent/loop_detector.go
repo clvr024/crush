@@ -15,13 +15,9 @@ import (
 const defaultLoopMaxRepeats = 3
 
 // loopDetectorHistorySize caps how many recent tool calls are retained.
-// It only needs to cover a few multiples of the repeat threshold.
+// Recurrence is counted over this whole history, so it also bounds how
+// far back the detector looks.
 const loopDetectorHistorySize = 10
-
-// oscillationWindowSize is how many recent guarded calls are scanned
-// for non-consecutive repetition of the same call (e.g. view A, grep B,
-// view A, ...). It must stay larger than the repeat threshold.
-const oscillationWindowSize = 6
 
 // loopDetectorContextKey is the context key carrying the current turn's
 // LoopDetector, installed by the coordinator.
@@ -29,11 +25,15 @@ type loopDetectorContextKey struct{}
 
 // LoopDetector watches tool invocations within a single agent turn and
 // blocks read-only exploration tools (view, grep, glob, ls) when the
-// model issues the exact same call too many times in a row, a strong
-// signal of an infinite loop. A blocked call never executes; instead a
-// guidance message is returned as the tool result so the model can
-// recover within the same turn. Any other tool (edit, write, bash, ...)
-// counts as forward progress and resets the repetition history.
+// model issues the exact same call maxRepeats times within the retained
+// history, whether back-to-back or interleaved with other calls (e.g.
+// view A, grep B, view A, ... or A, B, C, A, B, C, ...). That is a
+// strong signal of an infinite loop: re-issuing an identical read-only
+// call can only return bytes the model already has. A blocked call
+// never executes; instead a guidance message is returned as the tool
+// result so the model can recover within the same turn. Any other tool
+// (edit, write, bash, ...) counts as forward progress and resets the
+// repetition history.
 type LoopDetector struct {
 	mu          sync.Mutex
 	maxRepeats  int
@@ -105,14 +105,12 @@ func (d *LoopDetector) CheckAndRecord(toolName, rawArgs string) (blocked bool, m
 		return true, loopWarning(toolName, consecutive)
 	}
 
-	// Oscillation: the same call recurring within a window, even with
-	// other calls interleaved.
-	window := d.recentCalls
-	if len(window) > oscillationWindowSize {
-		window = window[len(window)-oscillationWindowSize:]
-	}
+	// Recurrence anywhere in the retained history: the same call issued
+	// maxRepeats times, even with other calls interleaved. This catches
+	// oscillating patterns like A, B, A, B, ... or A, B, C, A, B, C, ...
+	// that the consecutive check above misses.
 	total := 0
-	for _, r := range window {
+	for _, r := range d.recentCalls {
 		if same(r) {
 			total++
 		}

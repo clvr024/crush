@@ -86,19 +86,54 @@ func TestLoopDetector_OscillationAcrossTwoCalls(t *testing.T) {
 	}
 }
 
-func TestLoopDetector_OscillationWindowExpires(t *testing.T) {
+func TestLoopDetector_ThreeCycleDetected(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(3)
+	grepArgs := `{"pattern":"foo"}`
+	lsArgs := `{"path":"."}`
+
+	// A, B, C, A, B, C, ...: the 3rd occurrence of each signature is
+	// blocked, even though no two identical calls are adjacent.
+	sequence := []struct {
+		tool string
+		args string
+		want bool
+	}{
+		{"view", loopTestViewArgs, false}, // 1
+		{"grep", grepArgs, false},         // 2
+		{"ls", lsArgs, false},             // 3
+		{"view", loopTestViewArgs, false}, // 4
+		{"grep", grepArgs, false},         // 5
+		{"ls", lsArgs, false},             // 6
+		{"view", loopTestViewArgs, true},  // 7: 3rd identical view
+		{"grep", grepArgs, true},          // 8: 3rd identical grep
+		{"ls", lsArgs, true},              // 9: 3rd identical ls
+	}
+	for i, s := range sequence {
+		blocked, _ := d.CheckAndRecord(s.tool, s.args)
+		require.Equal(t, s.want, blocked, "call %d (%s)", i+1, s.tool)
+	}
+}
+
+func TestLoopDetector_OldCallsAgeOutOfHistory(t *testing.T) {
 	t.Parallel()
 
 	d := NewLoopDetector(3)
 
 	blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
 	require.False(t, blocked)
-	for i := 0; i < 6; i++ {
+	// Push the first view out of the retained history (cap 10).
+	for i := 0; i < 10; i++ {
 		blocked, _ = d.CheckAndRecord("grep", fmt.Sprintf(`{"pattern":"p%d"}`, i))
 		require.False(t, blocked)
 	}
 	blocked, _ = d.CheckAndRecord("view", loopTestViewArgs)
-	require.False(t, blocked, "the first view aged out of the 6-call window")
+	require.False(t, blocked, "the first view aged out of history")
+	blocked, _ = d.CheckAndRecord("view", loopTestViewArgs)
+	require.False(t, blocked, "only the 2nd sighting in retained history")
+	blocked, _ = d.CheckAndRecord("view", loopTestViewArgs)
+	require.True(t, blocked, "3rd sighting in retained history")
 }
 
 func TestLoopDetector_OscillationResetsOnMutatingCall(t *testing.T) {
