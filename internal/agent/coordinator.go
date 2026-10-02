@@ -381,7 +381,13 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	channel := ChannelFromContext(ctx)
 	c.syncSessionChannel(ctx, sessionID, channel)
 	run := func() (*fantasy.AgentResult, error) {
-		return agent.Run(ctx, SessionAgentCall{
+		// Fresh loop detector per turn: repetition history must not
+		// leak across turns, sessions, or retries of the same prompt.
+		// Threshold and history size are user-configurable via the
+		// loop-max-repeats and loop-history-size options.
+		opts := c.cfg.Config().Options
+		turnCtx := WithLoopDetector(ctx, NewLoopDetector(opts.GetLoopMaxRepeats(), opts.GetLoopHistorySize()))
+		return agent.Run(turnCtx, SessionAgentCall{
 			SessionID:         sessionID,
 			RunID:             runID,
 			Channel:           channel,

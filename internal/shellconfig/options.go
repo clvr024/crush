@@ -33,6 +33,8 @@ import (
 //	option auto-lsp false
 //	option request-timeout 300
 //	option request-timeout 0
+//	option loop-max-repeats 4
+//	option loop-history-size 20
 //
 // Boolean shortcuts: for boolean fields, omitting the value sets it to true.
 func handleOption(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -211,7 +213,9 @@ var optionSpecs = map[string]optionSpec{
 	"initialize-as":  {jsonKey: "initialize_as", kind: optString},
 
 	// Integer fields, in seconds.
-	"request-timeout": {jsonKey: "request_timeout", kind: optInt},
+	"request-timeout":   {jsonKey: "request_timeout", kind: optInt},
+	"loop-max-repeats":  {jsonKey: "loop_max_repeats", kind: optInt},
+	"loop-history-size": {jsonKey: "loop_history_size", kind: optInt},
 
 	// List fields. Keys are singular because each call appends one value.
 	"context-path":        {jsonKey: "context_paths", kind: optList},

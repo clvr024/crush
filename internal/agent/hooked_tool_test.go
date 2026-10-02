@@ -113,6 +113,31 @@ func TestHookedTool_DenySkipsInnerTool(t *testing.T) {
 	require.Contains(t, resp.Content, "blocked")
 }
 
+func TestHookedTool_LoopDetectorWorksWithoutHookRunner(t *testing.T) {
+	t.Parallel()
+
+	// No PreToolUse hooks configured: runner is nil, but loop
+	// detection must still fire.
+	inner := &countingTool{name: "view"}
+	tool := newHookedTool(inner, nil)
+
+	ctx := WithLoopDetector(t.Context(), NewLoopDetector(4, 0))
+	call := fantasy.ToolCall{ID: "call-1", Name: "view", Input: loopTestViewArgs}
+
+	for i := 0; i < 3; i++ {
+		resp, err := tool.Run(ctx, call)
+		require.NoError(t, err)
+		require.False(t, resp.IsError, "call %d should pass", i+1)
+	}
+	require.Equal(t, 3, inner.calls)
+
+	resp, err := tool.Run(ctx, call)
+	require.NoError(t, err)
+	require.True(t, resp.IsError, "4th identical call should be blocked without any hooks configured")
+	require.Contains(t, resp.Content, "Loop detected")
+	require.Equal(t, 3, inner.calls, "blocked call must not reach the inner tool")
+}
+
 func TestWrapToolsWithHooks(t *testing.T) {
 	t.Parallel()
 
@@ -139,9 +164,18 @@ func TestWrapToolsWithHooks(t *testing.T) {
 		}
 	})
 
-	t.Run("nil runner skips the wrap for both agent kinds", func(t *testing.T) {
+	t.Run("nil runner still wraps the top-level agent", func(t *testing.T) {
 		t.Parallel()
-		require.Equal(t, inputs, wrapToolsWithHooks(inputs, nil, false))
+		out := wrapToolsWithHooks(inputs, nil, false)
+		require.Len(t, out, len(inputs))
+		for i, tool := range out {
+			_, ok := tool.(*hookedTool)
+			require.Truef(t, ok, "tool %d should be a *hookedTool even without hooks", i)
+		}
+	})
+
+	t.Run("nil runner keeps sub-agent tools unwrapped", func(t *testing.T) {
+		t.Parallel()
 		require.Equal(t, inputs, wrapToolsWithHooks(inputs, nil, true))
 	})
 }

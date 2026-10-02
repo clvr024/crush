@@ -474,6 +474,8 @@ type Options struct {
 	Notifications             string       `json:"notifications,omitempty" jsonschema:"description=Notification style to use. Options: auto (default)\\, native\\, osc\\, bell\\, disabled. Auto selects based on environment: native for local sessions\\, osc for SSH (with automatic OSC 99/777 detection).,enum=auto,enum=native,enum=osc,enum=bell,enum=disabled,default=auto"`
 	DisabledSkills            []string     `json:"disabled_skills,omitempty" jsonschema:"description=List of skill names to disable and hide from the agent,example=crush-config"`
 	RequestTimeout            *int         `json:"request_timeout,omitempty" jsonschema:"description=Timeout in seconds for each LLM API request. Streaming responses are aborted only after this much inactivity\\, so slow but active streams are never killed. 0 disables it\\, negative values are invalid.,default=60,example=120,example=300,example=0"`
+	LoopMaxRepeats            *int         `json:"loop_max_repeats,omitempty" jsonschema:"description=How many times the model may issue the identical read-only tool call (view/grep/glob/ls) within recent history before the loop detector blocks it and returns guidance instead,default=4,example=3,example=6"`
+	LoopHistorySize           *int         `json:"loop_history_size,omitempty" jsonschema:"description=How many recent tool calls the loop detector retains when counting repetitions,default=10,example=20"`
 }
 
 // DefaultRequestTimeout bounds each LLM API request when the user has not
@@ -496,6 +498,38 @@ func (o *Options) GetRequestTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(*o.RequestTimeout) * time.Second
+}
+
+// DefaultLoopMaxRepeats is how many times the model may issue the
+// identical read-only tool call before the loop detector blocks it.
+const DefaultLoopMaxRepeats = 4
+
+// DefaultLoopHistorySize is how many recent tool calls the loop
+// detector retains for repetition counting.
+const DefaultLoopHistorySize = 10
+
+// GetLoopMaxRepeats returns how many times the identical read-only
+// tool call may be issued before the loop detector blocks it. The nil
+// receiver and the unset field both mean DefaultLoopMaxRepeats;
+// non-positive values are treated as unset.
+func (o *Options) GetLoopMaxRepeats() int {
+	if o == nil || o.LoopMaxRepeats == nil || *o.LoopMaxRepeats <= 0 {
+		return DefaultLoopMaxRepeats
+	}
+	return *o.LoopMaxRepeats
+}
+
+// GetLoopHistorySize returns how many recent tool calls the loop
+// detector retains. It is raised to GetLoopMaxRepeats when smaller,
+// so the threshold stays reachable.
+func (o *Options) GetLoopHistorySize() int {
+	if o == nil || o.LoopHistorySize == nil || *o.LoopHistorySize <= 0 {
+		return DefaultLoopHistorySize
+	}
+	if size := *o.LoopHistorySize; size >= o.GetLoopMaxRepeats() {
+		return size
+	}
+	return o.GetLoopMaxRepeats()
 }
 
 type MCPs map[string]MCPConfig
