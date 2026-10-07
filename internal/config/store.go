@@ -311,7 +311,7 @@ func (s *ConfigStore) atomicWrite(scope Scope, fn func(current []byte) ([]byte, 
 		return err
 	}
 
-	data, err := os.ReadFile(path)
+	data, err := readFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			data = []byte("{}")
@@ -348,7 +348,7 @@ func (s *ConfigStore) HasConfigField(scope Scope, key string) bool {
 	if err != nil {
 		return false
 	}
-	data, err := os.ReadFile(path)
+	data, err := readFile(path)
 	if err != nil {
 		return false
 	}
@@ -1129,7 +1129,7 @@ func (s *ConfigStore) loadTokenFromDisk(scope Scope, providerID string) (*oauth.
 		return nil, err
 	}
 
-	data, err := os.ReadFile(path)
+	data, err := readFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -1399,7 +1399,7 @@ func (s *ConfigStore) reloadFromDiskLocked(ctx context.Context) error {
 
 	// Merge workspace config if present
 	workspacePath := filepath.Join(cfg.Options.DataDirectory, fmt.Sprintf("%s.json", appName))
-	if wsData, err := os.ReadFile(workspacePath); err == nil && len(wsData) > 0 {
+	if wsData, err := readFile(workspacePath); err == nil && len(wsData) > 0 {
 		if !json.Valid(wsData) {
 			return fmt.Errorf("invalid JSON in config file %s", workspacePath)
 		}
