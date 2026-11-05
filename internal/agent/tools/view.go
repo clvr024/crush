@@ -47,7 +47,7 @@ func viewDescription() string {
 type ViewParams struct {
 	FilePath string `json:"file_path" description:"The path to the file to read"`
 	Offset   int    `json:"offset,omitempty" description:"The line number to start reading from (0-based)"`
-	Limit    int    `json:"limit,omitempty" description:"The number of lines to read (defaults to 200)"`
+	Limit    int    `json:"limit,omitempty" description:"The number of lines to read (defaults to 1000; increase when more context is needed)"`
 }
 
 type ViewPermissionsParams struct {
@@ -74,13 +74,21 @@ type ViewResponseMetadata struct {
 const (
 	ViewToolName     = "view"
 	MaxViewSize      = 200 * 1024 // 200KB
-	DefaultReadLimit = 200
+	DefaultReadLimit = 1000
 	MaxLineLength    = 2000
 )
 
 type contentTooLargeError struct {
 	Size int
 	Max  int
+}
+
+// DefaultViewReadLimit returns the default line limit for a resolved file path.
+func DefaultViewReadLimit(filePath string, skillsPaths ...string) int {
+	if strings.HasPrefix(filePath, skills.BuiltinPrefix) || isInSkillsPath(filePath, skillsPaths) {
+		return 1000000
+	}
+	return DefaultReadLimit
 }
 
 func (e contentTooLargeError) Error() string {
@@ -193,11 +201,7 @@ func NewViewTool(
 
 			// Set default limit if not provided (no limit for SKILL.md files)
 			if params.Limit <= 0 {
-				if isSkillFile {
-					params.Limit = 1000000 // Effectively no limit for skill files
-				} else {
-					params.Limit = DefaultReadLimit
-				}
+				params.Limit = DefaultViewReadLimit(absFilePath, skillsPaths...)
 			}
 
 			isSupportedImage, mimeType := getImageMimeType(filePath)
@@ -251,8 +255,10 @@ func NewViewTool(
 			output += addLineNumbers(content, params.Offset+1)
 
 			if hasMore {
-				output += fmt.Sprintf("\n\n(File has more lines. Use 'offset' parameter to read beyond line %d)",
+				output += fmt.Sprintf("\n\n(More lines available. Only continue if needed for the task; use offset=%d and a larger limit rather than many small reads.)",
 					params.Offset+len(strings.Split(content, "\n")))
+			} else {
+				output += "\n\n(End of file.)"
 			}
 			output += "\n</file>\n"
 			output += getDiagnostics(filePath, lspManager)
@@ -457,7 +463,7 @@ func readBuiltinFile(params ViewParams, skillTracker *skills.Tracker) (fantasy.T
 
 	limit := params.Limit
 	if limit <= 0 {
-		limit = 1000000 // Effectively no limit for skill files.
+		limit = DefaultViewReadLimit(params.FilePath)
 	}
 
 	lines := strings.Split(content, "\n")

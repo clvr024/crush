@@ -390,7 +390,10 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 		// Threshold and history size are user-configurable via the
 		// loop-max-repeats and loop-history-size options.
 		opts := c.cfg.Config().Options
-		turnCtx := WithLoopDetector(ctx, NewLoopDetector(opts.GetLoopMaxRepeats(), opts.GetLoopHistorySize()))
+		detector := NewLoopDetector(opts.GetLoopMaxRepeats(), opts.GetLoopHistorySize())
+		detector.workingDir = c.cfg.WorkingDir()
+		detector.skillsPaths = opts.SkillsPaths
+		turnCtx := WithLoopDetector(ctx, detector)
 		return agent.Run(turnCtx, SessionAgentCall{
 			SessionID:         sessionID,
 			RunID:             runID,

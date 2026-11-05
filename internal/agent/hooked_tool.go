@@ -70,7 +70,7 @@ func (h *hookedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.To
 	// call goes straight to the inner tool. Loop detection above
 	// still applies.
 	if h.runner == nil {
-		return h.inner.Run(ctx, call)
+		return h.runInner(ctx, call)
 	}
 
 	sessionID := tools.GetSessionFromContext(ctx)
@@ -81,6 +81,7 @@ func (h *hookedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.To
 	}
 
 	if result.Decision == hooks.DecisionDeny || result.Halt {
+		h.discardViewRange(ctx, call)
 		reason := fmt.Sprintf("Tool call blocked by hook. Reason: %s", result.Reason)
 		if result.Halt {
 			reason = fmt.Sprintf("Turn halted by hook. Reason: %s", result.Reason)
@@ -94,6 +95,7 @@ func (h *hookedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.To
 	}
 
 	if result.UpdatedInput != "" {
+		h.discardViewRange(ctx, call)
 		call.Input = result.UpdatedInput
 	}
 
@@ -104,7 +106,7 @@ func (h *hookedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.To
 		ctx = permission.WithHookApproval(ctx, call.ID)
 	}
 
-	resp, err := h.inner.Run(ctx, call)
+	resp, err := h.runInner(ctx, call)
 	if err != nil {
 		return resp, err
 	}
@@ -118,6 +120,22 @@ func (h *hookedTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.To
 
 	resp.Metadata = mergeHookMetadata(resp.Metadata, result)
 	return resp, nil
+}
+
+func (h *hookedTool) runInner(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	resp, err := h.inner.Run(ctx, call)
+	if err != nil || resp.IsError {
+		h.discardViewRange(ctx, call)
+	}
+	return resp, err
+}
+
+func (h *hookedTool) discardViewRange(ctx context.Context, call fantasy.ToolCall) {
+	if call.Name == tools.ViewToolName {
+		if detector, ok := loopDetectorFromContext(ctx); ok {
+			detector.recordFailedView(call.Input)
+		}
+	}
 }
 
 // buildHookMetadata creates a HookMetadata from an AggregateResult.

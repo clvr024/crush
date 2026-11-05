@@ -45,6 +45,7 @@ type BashResponseMetadata struct {
 	Description      string `json:"description"`
 	WorkingDirectory string `json:"working_directory"`
 	Background       bool   `json:"background,omitempty"`
+	AutoBackground   bool   `json:"auto_background,omitempty"`
 	ShellID          string `json:"shell_id,omitempty"`
 }
 
@@ -386,8 +387,13 @@ func NewBashTool(permissions permission.Service, workingDir, spillDir string, at
 				WorkingDirectory: bgShell.WorkingDir,
 				Background:       true,
 				ShellID:          bgShell.ID,
+				AutoBackground:   true,
 			}
-			response := fmt.Sprintf("Command is taking longer than expected and has been moved to background.\n\nBackground shell ID: %s\n\nUse job_output tool to view output or job_kill to terminate.", bgShell.ID)
+			response := fmt.Sprintf("Command is still running and has moved to the background after %d seconds. This is not a command failure.\n\nBackground shell ID: %s\n\nNext, use job_output with shell_id=%q, wait=true, timeout=30 to inspect progress and collect the exit status. Tell the user the current status before extended waits; do not leave this task untracked or report completion without its result. Use job_kill only if termination is needed.", autoBackgroundAfter, bgShell.ID, bgShell.ID)
+			if output := formatOutput(stdout, stderr, nil, spillDir); output != "" {
+				metadata.Output = output
+				response += "\n\nOutput so far:\n" + output
+			}
 			return fantasy.WithResponseMetadata(fantasy.NewTextResponse(response), metadata), nil
 		},
 	)

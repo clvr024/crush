@@ -85,6 +85,7 @@ type SessionAgentCall struct {
 	RunID             string
 	Channel           string
 	HiddenUserMessage bool
+	backgroundJobs    *backgroundJobTracker
 	Prompt            string
 	ProviderOptions   fantasy.ProviderOptions
 	Attachments       []message.Attachment
@@ -830,12 +831,17 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 
 	var stepMessages []fantasy.Message
 	var shouldSummarize bool
-	sanitizedToolCalls := make(map[string]bool)
+	sanitizedToolCalls := csync.NewMap[string, bool]()
 	// Full names of tool calls that completed without error this turn.
-	// Written only from the streaming callbacks (which run sequentially)
+	// Written from OnToolResult, which can run concurrently for parallel calls,
 	// and read after Stream returns, where sendChannelReply uses it to
 	// tell whether the model already replied on the originating channel.
-	completedToolCalls := make(map[string]struct{})
+	completedToolCalls := csync.NewMap[string, struct{}]()
+	if call.backgroundJobs == nil {
+		call.backgroundJobs = &backgroundJobTracker{jobs: make(map[string]int)}
+	}
+	var backgroundFollowup bool
+	var turnHalted atomic.Bool
 	// Don't send MaxOutputTokens if 0 — some providers (e.g. LM Studio) reject it
 	var maxOutputTokens *int64
 	if call.MaxOutputTokens > 0 {
@@ -886,6 +892,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 					return callContext, prepared, createErr
 				}
 				prepared.Messages = append(prepared.Messages, userMessage.ToAIMessage()...)
+			}
+			if reminder := call.backgroundJobs.reminder(); reminder != "" {
+				prepared.Messages = append(prepared.Messages, fantasy.NewUserMessage(reminder))
 			}
 
 			prepared.Messages = a.workaroundProviderMediaLimitations(prepared.Messages, largeModel)
@@ -1004,7 +1013,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
 			input, wasSanitized := sanitizeToolInput(tc.ToolName, tc.ToolCallID, tc.Input)
 			if wasSanitized {
-				sanitizedToolCalls[tc.ToolCallID] = true
+				sanitizedToolCalls.Set(tc.ToolCallID, true)
 			}
 			toolCall := message.ToolCall{
 				ID:               tc.ToolCallID,
@@ -1019,14 +1028,18 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			return a.messages.Update(ctx, *currentAssistant)
 		},
 		OnToolResult: func(result fantasy.ToolResultContent) error {
+			if result.StopTurn {
+				turnHalted.Store(true)
+			}
 			toolResult := a.convertToToolResult(result)
-			if sanitizedToolCalls[result.ToolCallID] {
+			if _, ok := sanitizedToolCalls.Get(result.ToolCallID); ok {
 				toolResult.Content = "Tool call failed: arguments were not valid JSON. Please check your tool call format and try again."
 				toolResult.IsError = true
 			}
 			if !toolResult.IsError && toolResult.Name != "" {
-				completedToolCalls[toolResult.Name] = struct{}{}
+				completedToolCalls.Set(toolResult.Name, struct{}{})
 			}
+			call.backgroundJobs.observe(toolResult)
 			// Use parent ctx instead of genCtx to ensure the message is created
 			// even if the request is canceled mid-stream
 			_, createMsgErr := a.messages.Create(ctx, currentAssistant.SessionID, message.CreateMessageParams{
@@ -1050,6 +1063,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 			case fantasy.FinishReasonToolCalls:
 				finishReason = message.FinishReasonToolUse
 			case fantasy.FinishReasonContentFilter:
+				turnHalted.Store(true)
 				// Provider safety classifier stopped the model
 				// (Anthropic stop_reason=refusal, OpenAI content_filter).
 				// The TUI owns the display copy; we only persist the
@@ -1115,10 +1129,34 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 				return false
 			},
 			func(steps []fantasy.StepResult) bool {
-				return hasRepeatedToolCalls(steps, loopDetectionWindowSize, loopDetectionMaxRepeats)
+				if hasRepeatedToolCalls(steps, loopDetectionWindowSize, loopDetectionMaxRepeats) {
+					turnHalted.Store(true)
+					return true
+				}
+				return false
 			},
 		},
 	})
+
+	if err == nil && !shouldSummarize && !turnHalted.Load() {
+		var followup string
+		followup, err = call.backgroundJobs.continuation(genCtx, tools.DefaultJobWaitTimeout*time.Second)
+		if followup != "" && err == nil {
+			mu := a.sessionMu(call.SessionID)
+			mu.Lock()
+			if genCtx.Err() == nil {
+				continuation := call
+				continuation.Prompt = followup
+				continuation.Attachments = nil
+				continuation.HiddenUserMessage = true
+				a.enqueueCall(continuation)
+				backgroundFollowup = true
+			} else {
+				err = genCtx.Err()
+			}
+			mu.Unlock()
+		}
+	}
 
 	a.eventPromptResponded(call.SessionID, time.Since(startTime).Truncate(time.Second))
 
@@ -1256,7 +1294,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		if channelErrorReplyWanted(call.Channel, err) {
 			a.sendChannelReply(ctx, call,
 				"Something went wrong while handling your message. Please try again.",
-				completedToolCalls)
+				completedToolCalls.Copy())
 		}
 		return nil, err
 	}
@@ -1284,8 +1322,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	// replies when it actually finishes. Runs before the busy state is
 	// released so a follow-up push queued behind this turn cannot
 	// overtake its reply.
-	if currentAssistant != nil && (!shouldSummarize || len(currentAssistant.ToolCalls()) == 0) {
-		a.sendChannelReply(ctx, call, currentAssistant.Content().String(), completedToolCalls)
+	if currentAssistant != nil && !backgroundFollowup && (!shouldSummarize || len(currentAssistant.ToolCalls()) == 0) {
+		a.sendChannelReply(ctx, call, currentAssistant.Content().String(), completedToolCalls.Copy())
 	}
 
 	// Release active request before publishing the notification.
@@ -1297,7 +1335,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 
 	// Send notification that agent has finished its turn (skip for
 	// nested/non-interactive sessions).
-	if !call.NonInteractive && a.notify != nil {
+	if !call.NonInteractive && !backgroundFollowup && a.notify != nil {
 		a.notify.Publish(pubsub.CreatedEvent, notify.Notification{
 			SessionID:    call.SessionID,
 			SessionTitle: currentSession.Title,

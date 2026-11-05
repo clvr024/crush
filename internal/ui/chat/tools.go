@@ -345,20 +345,24 @@ func (t *baseToolMessageItem) RawRender(width int) string {
 	content, height, ok := t.getCachedRender(toolItemWidth)
 	// if we are spinning or there is no cache rerender
 	if !ok || t.isSpinning() {
-		content = t.toolRenderer.RenderTool(t.sty, toolItemWidth, &ToolRenderOpts{
-			ToolCall:        t.toolCall,
-			Result:          t.result,
-			Anim:            t.anim,
-			ExpandedContent: t.expandedContent,
-			Compact:         t.isCompact,
-			IsSpinning:      t.isSpinning(),
-			Status:          t.computeStatus(),
-		})
+		if !t.expandedContent || t.isCompact {
+			content = t.renderSummary(toolItemWidth)
+		} else {
+			content = t.toolRenderer.RenderTool(t.sty, toolItemWidth, &ToolRenderOpts{
+				ToolCall:        t.toolCall,
+				Result:          t.result,
+				Anim:            t.anim,
+				ExpandedContent: t.expandedContent,
+				Compact:         t.isCompact,
+				IsSpinning:      t.isSpinning(),
+				Status:          t.computeStatus(),
+			})
 
-		// Prepend hook indicator if hooks ran for this tool call.
-		if t.result != nil {
-			if hookLine := toolOutputHookIndicator(t.sty, t.result.Metadata, toolItemWidth); hookLine != "" {
-				content = hookLine + "\n\n" + content
+			// Prepend hook indicator if hooks ran for this tool call.
+			if t.result != nil {
+				if hookLine := toolOutputHookIndicator(t.sty, t.result.Metadata, toolItemWidth); hookLine != "" {
+					content = hookLine + "\n\n" + content
+				}
 			}
 		}
 

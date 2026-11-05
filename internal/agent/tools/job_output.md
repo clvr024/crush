@@ -1,1 +1,1 @@
-Get stdout/stderr from a background shell by ID; set wait=true to block until completion.
+Get stdout/stderr, elapsed time, and status from a background shell by ID. Set wait=true to wait up to timeout seconds (default 30, maximum 60); if still running, return current output without stopping the command. For builds, tests, and other finite tasks, inspect progress and continue bounded waits until the result is collected. Explain important output, failures, or extended waits to the user. For servers and watchers, confirm startup rather than waiting for them to exit.

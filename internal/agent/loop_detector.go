@@ -4,11 +4,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/filepathext"
+	"github.com/charmbracelet/crush/internal/skills"
 )
 
 // loopDetectorContextKey is the context key carrying the current turn's
@@ -17,7 +23,7 @@ type loopDetectorContextKey struct{}
 
 // LoopDetector watches tool invocations within a single agent turn and
 // blocks read-only exploration tools (view, grep, glob, ls) when the
-// model issues the exact same call maxRepeats times within the retained
+// model issues equivalent calls maxRepeats times within the retained
 // history, whether back-to-back or interleaved with other calls (e.g.
 // view A, grep B, view A, ... or A, B, C, A, B, C, ...). That is a
 // strong signal of an infinite loop: re-issuing an identical read-only
@@ -29,6 +35,8 @@ type loopDetectorContextKey struct{}
 type LoopDetector struct {
 	mu          sync.Mutex
 	maxRepeats  int
+	workingDir  string
+	skillsPaths []string
 	maxHistory  int
 	recentCalls []toolCallRecord
 }
@@ -37,6 +45,14 @@ type LoopDetector struct {
 type toolCallRecord struct {
 	toolName string
 	argsHash string
+	view     *viewReadRange
+}
+
+type viewReadRange struct {
+	path    string
+	version string
+	start   int
+	end     int
 }
 
 // NewLoopDetector returns a LoopDetector that blocks a guarded tool call
@@ -84,14 +100,14 @@ func (d *LoopDetector) CheckAndRecord(toolName, rawArgs string) (blocked bool, m
 		return false, ""
 	}
 
-	hash := hashToolArgs(rawArgs)
-	d.recentCalls = append(d.recentCalls, toolCallRecord{toolName: toolName, argsHash: hash})
+	record := d.toolCallRecord(toolName, rawArgs)
+	d.recentCalls = append(d.recentCalls, record)
 	if len(d.recentCalls) > d.maxHistory {
 		d.recentCalls = d.recentCalls[len(d.recentCalls)-d.maxHistory:]
 	}
 
 	same := func(r toolCallRecord) bool {
-		return r.toolName == toolName && r.argsHash == hash
+		return r.toolName == toolName && r.argsHash == record.argsHash
 	}
 
 	// Consecutive identical calls.
@@ -119,7 +135,76 @@ func (d *LoopDetector) CheckAndRecord(toolName, rawArgs string) (blocked bool, m
 	if total >= d.maxRepeats {
 		return true, loopWarning(toolName, total)
 	}
+	if record.view != nil {
+		repeats := 0
+		for _, previous := range d.recentCalls {
+			if previous.view == nil || previous.view.path != record.view.path || previous.view.version != record.view.version {
+				continue
+			}
+			overlap := min(previous.view.end, record.view.end) - max(previous.view.start, record.view.start)
+			length := record.view.end - record.view.start
+			if overlap > 0 && float64(overlap)/float64(length) >= 0.9 {
+				repeats++
+			}
+		}
+		if repeats >= d.maxRepeats {
+			return true, fmt.Sprintf("Loop detected: you have requested the same or largely overlapping region of '%s' %d times recently. This call was blocked. Reuse the content already read and proceed with the task, or use grep/LSP to locate a different relevant section. Do not retry with small changes to offset or limit.", record.view.path, repeats)
+		}
+	}
 	return false, ""
+}
+
+func (d *LoopDetector) toolCallRecord(toolName, rawArgs string) toolCallRecord {
+	record := toolCallRecord{toolName: toolName, argsHash: hashToolArgs(rawArgs)}
+	if toolName != tools.ViewToolName {
+		return record
+	}
+
+	var params tools.ViewParams
+	if err := json.Unmarshal([]byte(rawArgs), &params); err != nil || params.FilePath == "" || params.Offset < 0 {
+		return record
+	}
+	if !strings.HasPrefix(params.FilePath, skills.BuiltinPrefix) {
+		path, err := filepath.Abs(filepathext.SmartJoin(d.workingDir, params.FilePath))
+		if err != nil {
+			return record
+		}
+		params.FilePath = path
+	}
+	if params.Limit <= 0 {
+		params.Limit = tools.DefaultViewReadLimit(params.FilePath, d.skillsPaths...)
+	}
+
+	version := ""
+	if info, err := os.Stat(params.FilePath); err == nil {
+		version = fmt.Sprintf("%d:%d", info.ModTime().UnixNano(), info.Size())
+	}
+	data, err := json.Marshal(params)
+	if err != nil {
+		return record
+	}
+	record.argsHash = hashToolArgs(string(data) + version)
+	maxInt := int(^uint(0) >> 1)
+	record.view = &viewReadRange{
+		path:    params.FilePath,
+		version: version,
+		start:   params.Offset,
+		end:     params.Offset + min(params.Limit, maxInt-params.Offset),
+	}
+	return record
+}
+
+func (d *LoopDetector) recordFailedView(rawArgs string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	record := d.toolCallRecord(tools.ViewToolName, rawArgs)
+	for i := len(d.recentCalls) - 1; i >= 0; i-- {
+		if d.recentCalls[i].toolName == tools.ViewToolName && d.recentCalls[i].argsHash == record.argsHash {
+			d.recentCalls[i].view = nil
+			return
+		}
+	}
 }
 
 // isLoopGuardedTool reports whether a tool is a read-only exploration
@@ -133,8 +218,16 @@ func isLoopGuardedTool(name string) bool {
 	}
 }
 
-// hashToolArgs returns a short stable hash of the raw tool arguments.
+// hashToolArgs returns a stable hash with JSON object keys in canonical order.
 func hashToolArgs(args string) string {
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(args))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err == nil && json.Valid([]byte(args)) {
+		if canonical, err := json.Marshal(value); err == nil {
+			args = string(canonical)
+		}
+	}
 	sum := sha256.Sum256([]byte(args))
 	return hex.EncodeToString(sum[:8])
 }

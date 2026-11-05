@@ -133,6 +133,55 @@ func TestViewToolAllowsSmallSectionsOfLargeFiles(t *testing.T) {
 	require.Equal(t, "target line", meta.Content)
 }
 
+func TestViewToolReadRanges(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		lineCount int
+		offset    int
+		limit     int
+		wantLines int
+		wantMore  bool
+	}{
+		{"small file in one call", 800, 0, 0, 800, false},
+		{"default limit", 1005, 0, 0, 1000, true},
+		{"explicit range", 800, 200, 25, 25, true},
+		{"larger explicit limit", 1005, 0, 1500, 1005, false},
+		{"last page", 1005, 1000, 0, 5, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			workingDir := t.TempDir()
+			filePath := filepath.Join(workingDir, "sample.txt")
+			lines := make([]string, tc.lineCount)
+			for i := range lines {
+				lines[i] = fmt.Sprintf("line %d", i+1)
+			}
+			require.NoError(t, os.WriteFile(filePath, []byte(strings.Join(lines, "\n")), 0o644))
+			ctx := context.WithValue(t.Context(), SessionIDContextKey, "test-session")
+			resp := runViewTool(t, newViewToolForTest(workingDir), ctx, ViewParams{
+				FilePath: filePath,
+				Offset:   tc.offset,
+				Limit:    tc.limit,
+			})
+			require.False(t, resp.IsError)
+
+			var meta ViewResponseMetadata
+			require.NoError(t, json.Unmarshal([]byte(resp.Metadata), &meta))
+			require.Equal(t, strings.Join(lines[tc.offset:tc.offset+tc.wantLines], "\n"), meta.Content)
+			if tc.wantMore {
+				require.Contains(t, resp.Content, fmt.Sprintf("offset=%d", tc.offset+tc.wantLines))
+				require.NotContains(t, resp.Content, "End of file")
+			} else {
+				require.Contains(t, resp.Content, "End of file")
+				require.NotContains(t, resp.Content, "More lines available")
+			}
+		})
+	}
+}
+
 func TestViewToolBlocksOversizedReturnedSections(t *testing.T) {
 	t.Parallel()
 

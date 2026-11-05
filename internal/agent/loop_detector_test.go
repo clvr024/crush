@@ -2,7 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -41,6 +44,167 @@ func TestLoopDetector_DifferentArgumentsDoNotTrigger(t *testing.T) {
 		args := fmt.Sprintf(`{"file_path":"main.go","offset":%d,"limit":100}`, i*100)
 		blocked, _ := d.CheckAndRecord("view", args)
 		require.False(t, blocked, "paginating with different offsets should not trigger")
+	}
+}
+
+func TestLoopDetector_EquivalentJSONArguments(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(3, 0)
+	for i, args := range []string{
+		`{"pattern":"foo","path":"src"}`,
+		`{ "path": "src", "pattern": "foo" }`,
+		`{"path":"src","pattern":"\u0066oo"}`,
+	} {
+		blocked, _ := d.CheckAndRecord("grep", args)
+		require.Equal(t, i == 2, blocked)
+	}
+}
+
+func TestLoopDetector_EquivalentViewArguments(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(3, 0)
+	d.workingDir = t.TempDir()
+	absolute, err := json.Marshal(filepath.Join(d.workingDir, "main.go"))
+	require.NoError(t, err)
+	for i, args := range []string{
+		`{"file_path":"./main.go"}`,
+		`{"limit":1000,"offset":0,"file_path":"main.go"}`,
+		fmt.Sprintf(`{"file_path":%s,"limit":0}`, absolute),
+	} {
+		blocked, _ := d.CheckAndRecord("view", args)
+		require.Equal(t, i == 2, blocked)
+	}
+}
+
+func TestLoopDetector_OverlappingViews(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(3, 0)
+	for i, args := range []string{
+		`{"file_path":"main.go","offset":0,"limit":200}`,
+		`{"file_path":"main.go","offset":5,"limit":195}`,
+		`{"file_path":"main.go","offset":10,"limit":190}`,
+	} {
+		blocked, msg := d.CheckAndRecord("view", args)
+		require.Equal(t, i == 2, blocked)
+		if blocked {
+			require.Contains(t, msg, "overlapping region")
+		}
+	}
+}
+
+func TestLoopDetector_SkillDefaultLimit(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(3, 0)
+	d.workingDir = t.TempDir()
+	d.skillsPaths = []string{d.workingDir}
+	require.NoError(t, os.WriteFile(filepath.Join(d.workingDir, "SKILL.md"), []byte("skill"), 0o644))
+	for _, limit := range []int{1000, 1000, 0} {
+		args := fmt.Sprintf(`{"file_path":"SKILL.md","limit":%d}`, limit)
+		blocked, _ := d.CheckAndRecord("view", args)
+		require.False(t, blocked, "the default skill limit must allow expanding beyond 1000 lines")
+	}
+}
+
+func TestLoopDetector_AllowsViewsWithNewContext(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		offsets []int
+		limits  []int
+	}{
+		{"expanding context", []int{0, 0, 0, 0}, []int{100, 200, 400, 800}},
+		{"pagination with context overlap", []int{0, 90, 180, 270}, []int{100, 100, 100, 100}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			d := NewLoopDetector(3, 0)
+			for i, offset := range tc.offsets {
+				args := fmt.Sprintf(`{"file_path":"main.go","offset":%d,"limit":%d}`, offset, tc.limits[i])
+				blocked, _ := d.CheckAndRecord("view", args)
+				require.False(t, blocked)
+			}
+		})
+	}
+}
+
+func TestLoopDetector_FileChangesAllowRereading(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(3, 0)
+	d.workingDir = t.TempDir()
+	path := filepath.Join(d.workingDir, "main.go")
+	require.NoError(t, os.WriteFile(path, []byte("original"), 0o644))
+	for range 2 {
+		blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
+		require.False(t, blocked)
+	}
+	require.NoError(t, os.WriteFile(path, []byte("changed content"), 0o644))
+	for range 2 {
+		blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
+		require.False(t, blocked)
+	}
+	blocked, _ := d.CheckAndRecord("view", loopTestViewArgs)
+	require.True(t, blocked)
+}
+
+func TestLoopDetector_DifferentFilesDoNotShareRanges(t *testing.T) {
+	t.Parallel()
+
+	d := NewLoopDetector(3, 0)
+	for i := range 5 {
+		args := fmt.Sprintf(`{"file_path":"file%d.go","offset":0,"limit":100}`, i)
+		blocked, _ := d.CheckAndRecord("view", args)
+		require.False(t, blocked)
+	}
+}
+
+func TestHookedTool_FailedViewsDoNotCountAsReadContext(t *testing.T) {
+	t.Parallel()
+
+	inner := &fakeTool{name: "view", resp: fantasy.NewTextErrorResponse("Content section is too large")}
+	tool := newHookedTool(inner, nil)
+	ctx := WithLoopDetector(t.Context(), NewLoopDetector(3, 0))
+	for _, limit := range []int{1000, 500, 100} {
+		resp, err := tool.Run(ctx, fantasy.ToolCall{
+			Name:  "view",
+			Input: fmt.Sprintf(`{"file_path":"main.go","limit":%d}`, limit),
+		})
+		require.NoError(t, err)
+		require.Contains(t, resp.Content, "Content section is too large")
+	}
+}
+
+func TestHookedTool_BlockedOrRewrittenViewsDoNotCountAsReadContext(t *testing.T) {
+	t.Parallel()
+
+	for _, command := range []string{
+		`echo '{"decision":"deny","reason":"blocked"}'`,
+		`echo '{"updated_input":{"file_path":"other.go","limit":100}}'`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			t.Parallel()
+
+			inner := &fakeTool{name: "view", resp: fantasy.NewTextResponse("ok")}
+			tool := newHookedTool(inner, newRunner(t, command))
+			detector := NewLoopDetector(3, 0)
+			ctx := WithLoopDetector(t.Context(), detector)
+			for _, limit := range []int{1000, 500, 100} {
+				resp, err := tool.Run(ctx, fantasy.ToolCall{
+					Name: "view", Input: fmt.Sprintf(`{"file_path":"main.go","limit":%d}`, limit),
+				})
+				require.NoError(t, err)
+				require.NotContains(t, resp.Content, "Loop detected")
+			}
+			for _, record := range detector.recentCalls {
+				require.Nil(t, record.view)
+			}
+		})
 	}
 }
 

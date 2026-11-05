@@ -34,6 +34,7 @@ Common shell builtins and core utils available on Windows.
 - Set run_in_background=true to run commands in a separate background shell
 - Returns a shell ID for managing the background process
 - Use job_output tool to view current output from background shell
+- When a build, test, or other finite command automatically moves to the background, it is still your responsibility: report its status and use job_output with wait=true and timeout=30 until you collect its result. Inspect current logs during long waits; do not silently wait indefinitely, repeatedly restart the command, or claim success without its exit status.
 - Use job_kill tool to terminate a background shell
 - IMPORTANT: NEVER use `&` at the end of commands to run in background - use run_in_background parameter instead
 - Commands that should run in background:

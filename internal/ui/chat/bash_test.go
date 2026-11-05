@@ -71,7 +71,7 @@ func TestBashToolMessageItem_LongCommandNotTruncated(t *testing.T) {
 }
 
 // TestBashToolMessageItem_OutputDefaultsCollapsed verifies that bash
-// output is truncated when collapsed and fully shown when expanded.
+// output is hidden when collapsed and fully shown when expanded.
 func TestBashToolMessageItem_OutputDefaultsCollapsed(t *testing.T) {
 	t.Parallel()
 
@@ -94,9 +94,10 @@ func TestBashToolMessageItem_OutputDefaultsCollapsed(t *testing.T) {
 	require.False(t, bash.expandedContent, "bash items must default to collapsed")
 
 	renderCollapsed := ansi.Strip(bash.RawRender(120))
-	require.Contains(t, renderCollapsed, "line10")
+	require.Contains(t, renderCollapsed, "seq 20")
+	require.NotContains(t, renderCollapsed, "\n")
+	require.NotContains(t, renderCollapsed, "line10")
 	require.NotContains(t, renderCollapsed, "line20")
-	require.Contains(t, renderCollapsed, "… (10 lines hidden)")
 
 	require.True(t, bash.ToggleExpanded(), "first toggle should report expanded")
 	require.Contains(t, ansi.Strip(bash.RawRender(120)), "line20")

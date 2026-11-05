@@ -50,6 +50,7 @@ type BackgroundShell struct {
 	Description string
 	Shell       *Shell
 	WorkingDir  string
+	StartedAt   time.Time
 	ctx         context.Context
 	cancel      context.CancelFunc
 	stdout      *syncBuffer
@@ -106,6 +107,7 @@ func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, b
 		Command:     command,
 		Description: description,
 		WorkingDir:  workingDir,
+		StartedAt:   time.Now(),
 		Shell:       shell,
 		ctx:         shellCtx,
 		cancel:      cancel,
