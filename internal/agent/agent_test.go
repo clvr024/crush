@@ -30,25 +30,21 @@ func TestMain(m *testing.M) {
 }
 
 var modelPairs = []modelPair{
-	{"deepseek-v4", hyperBuilder("deepseek-v4-pro-0813"), hyperBuilder("deepseek-v4-flash-0731")},
-}
-
-func getModels(t *testing.T, r *vcr.Recorder, pair modelPair) (fantasy.LanguageModel, fantasy.LanguageModel) {
-	large, err := pair.largeModel(t, r)
-	require.NoError(t, err)
-	small, err := pair.smallModel(t, r)
-	require.NoError(t, err)
-	return large, small
+	{"deepseek-v4", hyperBuilder("deepseek-v4-pro-0813")},
 }
 
 func setupAgent(t *testing.T, pair modelPair) (SessionAgent, fakeEnv) {
+	t.Helper()
 	r := vcr.NewRecorder(t)
-	large, small := getModels(t, r, pair)
+	large, err := pair.largeModel(t, r)
+	require.NoError(t, err)
 	env := testEnv(t)
 
 	createSimpleGoProject(t, env.workingDir)
-	agent, err := coderAgent(r, env, large, small)
+	// Tool cassettes contain no title requests; titles have separate tests.
+	agent, err := coderAgent(r, env, large, fastModel{})
 	require.NoError(t, err)
+	t.Cleanup(agent.CancelAll)
 	return agent, env
 }
 

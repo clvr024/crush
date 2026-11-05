@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/dnaeon/go-vcr.v4/pkg/cassette"
 
 	_ "github.com/joho/godotenv/autoload"
 )
@@ -44,7 +46,38 @@ type builderFunc func(t *testing.T, r *vcr.Recorder) (fantasy.LanguageModel, err
 type modelPair struct {
 	name       string
 	largeModel builderFunc
-	smallModel builderFunc
+}
+
+// cassetteModel makes a missing recording fail without provider retry delays.
+type cassetteModel struct {
+	fantasy.LanguageModel
+}
+
+func (m cassetteModel) Stream(ctx context.Context, call fantasy.Call) (fantasy.StreamResponse, error) {
+	stream, err := m.LanguageModel.Stream(ctx, call)
+	if err != nil {
+		return stream, cassetteError(err)
+	}
+	return func(yield func(fantasy.StreamPart) bool) {
+		for part := range stream {
+			part.Error = cassetteError(part.Error)
+			if !yield(part) {
+				return
+			}
+		}
+	}, nil
+}
+
+func cassetteError(err error) error {
+	if errors.Is(err, cassette.ErrInteractionNotFound) {
+		return &fantasy.ProviderError{
+			Title:      "Recorded request did not match",
+			Message:    err.Error(),
+			Cause:      err,
+			StatusCode: http.StatusBadRequest,
+		}
+	}
+	return err
 }
 
 func hyperBuilder(model string) builderFunc {
@@ -57,7 +90,11 @@ func hyperBuilder(model string) builderFunc {
 		if err != nil {
 			return nil, err
 		}
-		return provider.LanguageModel(t.Context(), model)
+		languageModel, err := provider.LanguageModel(t.Context(), model)
+		if err != nil {
+			return nil, err
+		}
+		return cassetteModel{languageModel}, nil
 	}
 }
 

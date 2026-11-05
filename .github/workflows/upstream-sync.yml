@@ -53,7 +53,8 @@ jobs:
 
       - name: Test merged code
         if: steps.merge.outputs.should_release == 'true'
-        run: go test ./...
+        timeout-minutes: 20
+        run: go test -v -failfast -timeout=10m ./...
 
       - name: Push merge
         if: steps.merge.outputs.changed == 'true'
