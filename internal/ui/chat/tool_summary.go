@@ -11,11 +11,11 @@ import (
 )
 
 func (t *baseToolMessageItem) renderSummary(width int) string {
-	var params map[string]json.RawMessage
-	_ = json.Unmarshal([]byte(t.toolCall.Input), &params)
+	params := partialJSONFields(t.toolCall.Input)
 	var description string
-	for _, key := range []string{"description", "file_path", "pattern", "command", "query", "url", "path", "shell_id", "symbol", "name", "prompt"} {
-		if json.Unmarshal(params[key], &description) == nil && description != "" {
+	for _, key := range []string{"description", "file_path", "pattern", "command", "query", "url", "path", "shell_id", "symbol", "name", "label", "prompt"} {
+		if value, ok := params[key].(string); ok && value != "" {
+			description = value
 			break
 		}
 	}
@@ -91,7 +91,30 @@ func (t *baseToolMessageItem) renderSummary(width int) string {
 	if t.isCompact {
 		prefix = ""
 	}
-	header := toolHeader(t.sty, status, prettifyToolName(t.toolCall.Name), max(0, width-ansi.StringWidth(prefix)), &ToolRenderOpts{Compact: t.isCompact}, description)
+	opts := &ToolRenderOpts{ToolCall: t.toolCall, Result: t.result, Compact: t.isCompact}
+	headerWidth := max(0, width-ansi.StringWidth(prefix))
+	name := prettifyToolName(t.toolCall.Name)
+	var header string
+	if t.result == nil || !t.result.IsError {
+		switch renderer := t.toolRenderer.(type) {
+		case *AgentToolRenderContext:
+			if renderer.agent.dispatchLabel != "" {
+				if t.isSpinning() {
+					status = ToolStatusRunning
+				}
+				header = subagentHeader(t.sty, status, name, renderer.agent.dispatchLabel, dispatchRunModel(opts), headerWidth, opts)
+			}
+		case *AgentControlToolRenderContext:
+			if label, _ := agentControlParts(t.toolCall); label != "" {
+				header = subagentHeader(t.sty, status, name, label, sendRunModel(opts), headerWidth, opts)
+			}
+		}
+	}
+	if header == "" {
+		header = toolHeader(t.sty, status, name, headerWidth, opts, description)
+	} else if t.isSpinning() {
+		header += " " + t.anim.Render()
+	}
 	return ansi.Truncate(prefix+header, max(0, width), "…")
 }
 

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"charm.land/fantasy"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/stretchr/testify/require"
 )
@@ -14,7 +15,7 @@ func TestJobOutputBoundedWaitLeavesJobRunning(t *testing.T) {
 	t.Parallel()
 
 	manager := shell.GetBackgroundShellManager()
-	job, err := manager.Start(t.Context(), t.TempDir(), nil, "echo started; sleep 10", "Build")
+	job, err := manager.Start(t.Context(), t.TempDir(), nil, "echo started; sleep 10", "Build", config.DefaultMaxBackgroundJobs)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = manager.Kill(job.ID) })
 	input, err := json.Marshal(JobOutputParams{ShellID: job.ID, Wait: true, Timeout: 1})
@@ -37,7 +38,7 @@ func TestJobOutputMarksCommandFailure(t *testing.T) {
 	t.Parallel()
 
 	manager := shell.GetBackgroundShellManager()
-	job, err := manager.Start(t.Context(), t.TempDir(), nil, "echo failed; exit 42", "Test")
+	job, err := manager.Start(t.Context(), t.TempDir(), nil, "echo failed; exit 42", "Test", config.DefaultMaxBackgroundJobs)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = manager.Kill(job.ID) })
 	job.Wait()

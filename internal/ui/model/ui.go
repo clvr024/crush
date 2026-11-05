@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -17,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -25,8 +27,9 @@ import (
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/catwalk/pkg/catwalk"
+	"charm.land/catwalk/v3/pkg/catwalk"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/crush/internal/agent"
 	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/agent/notify"
 	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
@@ -42,10 +45,12 @@ import (
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
+	"github.com/charmbracelet/crush/internal/pinentry"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/question"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/internal/sshaskpass"
 	"github.com/charmbracelet/crush/internal/stringext"
 	"github.com/charmbracelet/crush/internal/ui/attachments"
 	"github.com/charmbracelet/crush/internal/ui/chat"
@@ -250,6 +255,10 @@ type UI struct {
 	// config round-trip may not reflect the selection immediately.
 	userThemeSelected bool
 
+	// hostTheme tracks the theme a host application pushes through the
+	// server (see hosttheme.go).
+	hostTheme hostThemeState
+
 	focus uiFocusState
 	state uiState
 	mode  uiInputMode
@@ -269,10 +278,6 @@ type UI struct {
 	// modeSwitching is true while the async agent-model update kicked off
 	// by setInputMode is still in flight; sending is blocked meanwhile.
 	modeSwitching bool
-
-	// cycleYolo is true while YOLO was enabled by the Shift+Tab input-mode
-	// cycle, which is the only case where the cycle may disable it again.
-	cycleYolo bool
 
 	keyMap KeyMap
 	keyenh tea.KeyboardEnhancementsMsg
@@ -306,9 +311,9 @@ type UI struct {
 	sendProgressBar    bool
 	progressBarEnabled bool
 
-	// turnOutcome is the result of the last agent turn reported to the
-	// terminal as program status (done or error) until the user has seen
-	// it, or empty.
+	// turnOutcome is the result of the last agent turn (done or error),
+	// reported to the terminal until the user has seen it. See
+	// trackTurnOutcome.
 	turnOutcome tea.ProgramState
 
 	// caps hold different terminal capabilities that we query for.
@@ -430,11 +435,12 @@ type UI struct {
 	// in-flight fetch captures it at dispatch and its result is discarded
 	// if the generation has moved on (see workspace_cache.go).
 	promptQueueGen uint64
-	// agentBusyCache / yoloCache memoize the workspace busy and permission
-	// probes (synchronous HTTP round-trips in client/server mode). Reads
-	// never probe; refreshes happen off-thread (see workspace_cache.go).
+	// agentBusyCache / permModeCache memoize the workspace busy and
+	// permission-mode probes (synchronous HTTP round-trips in client/server
+	// mode). Reads never probe; refreshes happen off-thread (see
+	// workspace_cache.go).
 	agentBusyCache    ttlCache
-	yoloCache         ttlCache
+	permModeCache     modeTTLCache
 	busyFetchInFlight bool
 	// agentReady / agentModel memoize the coordinator readiness and
 	// selected model (AgentIsReady/AgentModel are synchronous HTTP GETs in
@@ -447,19 +453,50 @@ type UI struct {
 	// like promptQueueGen it lets a stale in-flight probe result be
 	// discarded and re-fetched instead of clobbering newer state.
 	busyFetchGen uint64
-	pillsView    string
+	// probedSessionBusy is the last busy probe of probedSession, covering
+	// runs this client did not start.
+	probedSession     string
+	probedSessionBusy bool
+	pillsView         string
 
 	// Todo spinner
 	todoSpinner    spinner.Model
 	todoIsSpinning bool
 
+	// pending is the turn this client sent; the placeholder items in the
+	// chat are derived from it by syncPendingItem.
+	pending pendingTurn
+
 	// preThemeStyles stores the styles before a theme preview so we can revert.
 	preThemeStyles *styles.Styles
+
+	// program is the running Bubble Tea program, set via SetProgram. It is
+	// needed to release and restore the terminal when a terminal-based GPG
+	// pinentry dialog takes over the screen.
+	program *tea.Program
+
+	// pinentryActive tracks whether the terminal is currently handed over
+	// to a pinentry dialog; pinentryTouchPending tracks whether the status
+	// bar shows the security key touch hint.
+	pinentryActive       bool
+	pinentryTouchPending bool
+	// pinentryCtrlL tracks whether the active pinentry dialog is an
+	// ncurses flavor that repaints its UI on Ctrl-L.
+	pinentryCtrlL bool
+	// pinentryTermMu serializes terminal release/restore commands, which
+	// Bubble Tea runs on separate goroutines.
+	pinentryTermMu sync.Mutex
 
 	// mouse highlighting related state
 	lastClickTime time.Time
 	hoverX        int
 	hoverY        int
+
+	// subAgentsRunning is how many subagents were still working as of the
+	// last update. Counting them walks the whole transcript, and the header
+	// needs the number on every frame, so it is counted once per update
+	// rather than once per frame.
+	subAgentsRunning int
 
 	// hyperCredits is the remaining Hyper credits as last fetched from
 	// the /v1/credits endpoint. It is nil when no fetch has reported a
@@ -565,11 +602,11 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 		ui.userThemeSelected = common.ThemeNameFromConfig(cfg) != ""
 	}
 
-	// Seed the yolo cache once at construction; afterwards it is kept
-	// fresh by write-through toggles and off-thread refreshes so Update
+	// Seed the permission-mode cache once at construction; afterwards it is
+	// kept fresh by write-through toggles and off-thread refreshes so Update
 	// and View never probe the workspace synchronously.
-	yolo := com.Workspace.PermissionSkipRequests()
-	ui.yoloCache.set(yolo)
+	permMode := com.Workspace.PermissionMode()
+	ui.permModeCache.set(permMode)
 
 	// Seed the memoized agent ready/model state the same way so the first
 	// frame renders the model info; the busy probe keeps it fresh
@@ -579,7 +616,7 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 		ui.agentModel = com.Workspace.AgentModel()
 	}
 	ui.mode = uiInputModeCode
-	ui.setEditorPrompt(yolo)
+	ui.setEditorPrompt(permMode)
 	ui.randomizePlaceholders()
 	ui.textarea.Placeholder = ui.readyPlaceholder
 	ui.status = status
@@ -611,6 +648,14 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 	ui.mouseEnabled = opts.TUI.Mouse == nil || *opts.TUI.Mouse
 
 	return ui
+}
+
+// SetProgram gives the model a handle to the running Bubble Tea program.
+// It is used to release and restore the terminal when a terminal-based GPG
+// pinentry dialog takes over the screen. Must be called before the program
+// starts processing pinentry events.
+func (m *UI) SetProgram(program *tea.Program) {
+	m.program = program
 }
 
 // Init initializes the UI model.
@@ -843,6 +888,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.beginFrameUpdate()
 	// Update terminal capabilities
 	m.caps.Update(msg)
+	m.trackTurnOutcome(msg)
 	switch msg := msg.(type) {
 	case tea.EnvMsg:
 		// Is this Windows Terminal?
@@ -856,7 +902,6 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateNotificationBackend()
 	case tea.FocusMsg:
 		m.notifyWindowFocused = true
-		m.turnOutcome = ""
 	case tea.BlurMsg:
 		m.notifyWindowFocused = false
 	case dialog.CollapseInlineMsg:
@@ -866,6 +911,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 	case pubsub.Event[notify.RunComplete]:
+		m.endPendingTurn(msg.Payload.SessionID)
 		if cmd := m.handlePlanHandoff(msg.Payload); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
@@ -885,7 +931,12 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 	case agentRunSubmittedMsg:
-		m.turnOutcome = ""
+		if msg.err != nil {
+			// The run never started, so no terminal event is coming to
+			// retire its spinner.
+			m.endPendingTurn(msg.sessionID)
+			cmds = append(cmds, util.ReportError(msg.err))
+		}
 		// A prompt was just accepted (run started or enqueued): fetch the
 		// authoritative busy/queue state to confirm the optimistic values
 		// sendMessage wrote.
@@ -909,6 +960,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if cmd := m.resetPlanModeState(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
+			m.turnOutcome = ""
 		}
 		m.setState(uiChat, m.focus)
 		m.session = msg.session
@@ -1139,6 +1191,12 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case pubsub.Event[permission.PermissionNotification]:
 		m.handlePermissionNotification(msg.Payload)
+	case pubsub.Event[pinentry.Event]:
+		cmds = append(cmds, m.handlePinentryEvent(msg.Payload))
+	case pubsub.Event[pinentry.PromptRequest]:
+		cmds = append(cmds, m.openPinentryDialog(msg.Payload))
+	case pubsub.Event[pinentry.Notification]:
+		m.handlePinentryNotification(msg.Payload)
 	case pubsub.Event[question.Request]:
 		m.openBatchFormDialog(msg.Payload)
 		m.chat.ScrollToBottom()
@@ -1150,6 +1208,10 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case pubsub.Event[question.Notification]:
 		m.handleQuestionNotification(msg.Payload)
+	case pubsub.Event[sshaskpass.PromptRequest]:
+		cmds = append(cmds, m.handleSSHPrompt(msg.Payload)...)
+	case pubsub.Event[sshaskpass.Notification]:
+		m.handleSSHNotification(msg.Payload)
 	case cancelTimerExpiredMsg:
 		m.isCanceling = false
 	case tea.TerminalVersionMsg:
@@ -1224,7 +1286,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// editor layout area, above the textarea.
 		if m.activeInline == nil && msg.Button == uv.MouseLeft && len(m.attachments.List()) > 0 && msg.Y == m.layout.editor.Min.Y {
 			relX := msg.X - m.layout.editor.Min.X
-			if m.attachments.HandleClick(relX) {
+			if m.changeAttachments(func() bool { return m.attachments.HandleClick(relX) }) {
 				return m, tea.Batch(cmds...)
 			}
 		}
@@ -1528,28 +1590,38 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == util.InfoTypeError {
 			slog.Error("Error reported", "error", msg.Msg)
 		}
-		m.status.SetInfoMsg(msg)
-		ttl := msg.TTL
-		if ttl <= 0 {
-			ttl = DefaultStatusTTL
-		}
-		cmds = append(cmds, clearInfoMsgCmd(ttl))
+		cmds = append(cmds, m.status.Show(msg))
 	case app.UpdateAvailableMsg:
 		text := fmt.Sprintf("Crush update available: v%s → v%s.", msg.CurrentVersion, msg.LatestVersion)
 		if msg.IsDevelopment {
 			text = fmt.Sprintf("This is a development version of Crush. The latest version is v%s.", msg.LatestVersion)
 		}
-		ttl := 10 * time.Second
-		m.status.SetInfoMsg(util.InfoMsg{
+		cmds = append(cmds, m.status.Show(util.InfoMsg{
 			Type: util.InfoTypeUpdate,
 			Msg:  text,
-			TTL:  ttl,
-		})
-		cmds = append(cmds, clearInfoMsgCmd(ttl))
+			TTL:  10 * time.Second,
+		}))
 	case workspace.ConnectionEvent:
 		cmds = append(cmds, m.handleConnectionEvent(msg)...)
+	case workspace.HostThemeEvent:
+		if cmd := m.handleHostThemeEvent(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case hostThemeStylesMsg:
+		if cmd := m.handleHostThemeStyles(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	case transparencyToggledMsg:
+		// The user's choice wins over a host theme's override.
+		m.isTransparent = msg.transparent
+		m.hostTheme.transparent = false
+		status := "disabled"
+		if msg.transparent {
+			status = "enabled"
+		}
+		cmds = append(cmds, util.ReportInfo("Transparent background "+status))
 	case util.ClearStatusMsg:
-		m.status.ClearInfoMsg()
+		m.status.ClearInfoMsg(msg.Seq)
 	case completions.CompletionItemsLoadedMsg:
 		if m.completionsOpen {
 			m.completions.SetItems(msg.Files, msg.Resources)
@@ -1597,8 +1669,13 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.textarea.Placeholder = m.readyPlaceholder
 		}
-		if !m.bangMode && m.mode != uiInputModePlan && m.yoloModeCached() {
-			m.textarea.Placeholder = "Go crazy"
+		if !m.bangMode && m.mode != uiInputModePlan {
+			switch m.permModeCached() {
+			case permission.PermissionModeYolo:
+				m.textarea.Placeholder = "Go crazy"
+			case permission.PermissionModeSysadmin:
+				m.textarea.Placeholder = "Sysadmin mode!"
+			}
 		}
 	}
 	if m.textarea.Placeholder != prevPlaceholder {
@@ -1612,15 +1689,32 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// at this point this can only handle [message.Attachment] message, and we
 	// should return all cmds anyway.
-	if m.attachments.Update(msg) {
+	if _, isAttachment := msg.(message.Attachment); isAttachment && m.attachmentsLimitReached() {
+		max := m.currentModelMaxAttachments()
+		cmds = append(cmds, util.ReportWarn(fmt.Sprintf("Maximum attachment reached for this session (%d)", max)))
+	} else if m.changeAttachments(func() bool { return m.attachments.Update(msg) }) {
 		m.invalidateFrames()
 	}
 	// Any update may have put a spinner on screen (new message, tool update,
 	// scroll, session load); make sure the clock is running. This is the
 	// sole place the clock is armed so a tick never sits inside a caller's
 	// tea.Sequence.
+	// The header spins while subagents work, and they work out of sight:
+	// that is the whole reason the header says anything about them. So the
+	// clock cannot be left to the transcript alone, which only arms it for
+	// an item currently on screen. Without this the spinner sat still and
+	// then jumped several frames whenever an unrelated message happened to
+	// force a repaint.
+	m.subAgentsRunning = m.runningSubAgents()
 	if m.state == uiChat {
+		m.chat.SetExternalAnimation(m.subAgentsRunning > 0)
 		if cmd := m.chat.EnsureAnimating(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		// Same for the chat scrollbar's auto-hide: a scroll may be applied
+		// from anywhere, so the deadline is armed here instead of being
+		// handed back to each call site to forward.
+		if cmd := m.chat.EnsureScrollbarHide(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 	}
@@ -1641,7 +1735,10 @@ func (m *UI) handleAnimTick(msg animTickMsg) tea.Cmd {
 		return nil
 	}
 	changed, cmd := m.chat.Tick(msg)
-	if !changed {
+	if !changed && m.subAgentsRunning == 0 {
+		// Nothing moved on screen, so the frame can be reused. It cannot be
+		// when the header is spinning: that spinner is outside the list and
+		// reusing the frame would freeze it.
 		m.markScrollOnly()
 		return cmd
 	}
@@ -1685,6 +1782,9 @@ func (m *UI) setSessionMessages(msgs []message.Message) tea.Cmd {
 	// Load nested tool calls for agent/agentic_fetch tools.
 	m.loadNestedToolCalls(items)
 	m.setMessagePlanFlags(items)
+	replayDispatchReports(items, msgPtrs, func(messageID, toolCallID string) bool {
+		return m.com.Workspace.AgentIsSessionBusy(m.com.Workspace.CreateAgentToolSessionID(messageID, toolCallID))
+	})
 
 	// If the user switches between sessions while the agent is working we
 	// want to make sure the animations are shown. Gate on the agent actually
@@ -1699,8 +1799,63 @@ func (m *UI) setSessionMessages(msgs []message.Message) tea.Cmd {
 	if cmd := m.chat.SetMessages(items...); cmd != nil {
 		cmds = append(cmds, cmd)
 	}
+	// SetMessages rebuilds the items from stored messages, which cannot
+	// include the placeholder. Put it back when this session is still
+	// waiting on one, so switching away and back does not lose the
+	// spinner for the rest of the turn.
+	if m.syncPendingItem() {
+		m.chat.SetAnimationsAllowed(true)
+	}
 	m.chat.SelectLast()
 	return tea.Sequence(cmds...)
+}
+
+// replayDispatchReports settles dispatch items whose subagent is no longer
+// working.
+//
+// A dispatched subagent outlives its own tool result, so the report landing
+// later is the only sign it finished. On a live run that report arrives as
+// an event, but a session read back from storage has to recover it from the
+// transcript: without this every subagent that finished long ago would look
+// like it is still working, in the transcript, the sidebar, the header count
+// and the warning shown when quitting.
+//
+// Only the latest dispatch under a label can still be working, and only if
+// it has not reported since. Even then it may have been cut off when Crush
+// last exited, so busy asks the backend whether its session is live.
+func replayDispatchReports(items []chat.MessageItem, msgs []*message.Message, busy func(messageID, toolCallID string) bool) {
+	latest := agent.LatestDispatches(msgs)
+	forEachToolItem(items, func(item chat.ToolMessageItem) {
+		dispatch, ok := item.(*chat.AgentToolMessageItem)
+		if !ok || dispatch.DispatchLabel() == "" {
+			return
+		}
+		state, ok := latest[dispatch.DispatchLabel()]
+		callID := dispatch.ToolCall().ID
+		if ok && state.CallID == callID && state.Open && busy(dispatch.MessageID(), callID) {
+			return
+		}
+		dispatch.MarkDispatchReported()
+	})
+}
+
+// forEachToolItem visits every tool item in items, including those nested
+// inside another tool.
+func forEachToolItem(items []chat.MessageItem, visit func(chat.ToolMessageItem)) {
+	for _, item := range items {
+		tool, ok := item.(chat.ToolMessageItem)
+		if !ok {
+			continue
+		}
+		visit(tool)
+		if container, ok := item.(chat.NestedToolContainer); ok {
+			nested := make([]chat.MessageItem, 0, len(container.NestedTools()))
+			for _, n := range container.NestedTools() {
+				nested = append(nested, n)
+			}
+			forEachToolItem(nested, visit)
+		}
+	}
 }
 
 // handleConnectionEvent reports the health of the client-server link and,
@@ -1728,8 +1883,7 @@ func (m *UI) handleConnectionEvent(msg workspace.ConnectionEvent) []tea.Cmd {
 			TTL:  DefaultStatusTTL,
 		}
 	}
-	m.status.SetInfoMsg(info)
-	cmds := []tea.Cmd{clearInfoMsgCmd(info.TTL)}
+	cmds := []tea.Cmd{m.status.Show(info)}
 	if msg.State == workspace.ConnectionRecovered {
 		// Events published while the stream was down are gone: re-sync the
 		// memoized MCP states alongside the session reload.
@@ -1821,6 +1975,12 @@ func (m *UI) setMessagePlanFlags(items []chat.MessageItem) {
 func (m *UI) appendSessionMessage(msg message.Message) tea.Cmd {
 	var cmds []tea.Cmd
 
+	// The real message carries its own spinner from here on.
+	if msg.Role == message.Assistant && m.pending.sessionID == msg.SessionID {
+		m.handOffPendingTurn()
+	}
+	defer m.syncPendingItem()
+
 	existing := m.chat.MessageItem(msg.ID)
 	if existing != nil {
 		// message already exists, skip
@@ -1831,17 +1991,20 @@ func (m *UI) appendSessionMessage(msg message.Message) tea.Cmd {
 	case message.User:
 		// Shell commands are rendered live via shellResultMsg; skip
 		// the persisted duplicate.
-		hasShellCmd := false
-		for _, part := range msg.Parts {
-			if _, ok := part.(message.ShellCommand); ok {
-				hasShellCmd = true
-				break
-			}
-		}
-		if hasShellCmd {
+		if msg.HasShellCommand() {
 			return nil
 		}
-		m.lastUserMessageTime = msg.CreatedAt
+		// A subagent report arrives on a user-role message but is not
+		// the user speaking, so it does not move the last-user mark. It
+		// does end the dispatch item's spinner, since the report landing
+		// is the only signal that the subagent finished.
+		if reports := msg.SubAgentReports(); len(reports) > 0 {
+			for _, report := range reports {
+				m.markDispatchReported(report.Label)
+			}
+		} else {
+			m.lastUserMessageTime = msg.CreatedAt
+		}
 		items := chat.ExtractMessageItems(m.com.Styles, &msg, nil, m.com.Workspace.WorkingDir())
 		m.chat.AppendMessages(items...)
 		m.chat.ScrollToBottom()
@@ -1868,6 +2031,14 @@ func (m *UI) appendSessionMessage(msg message.Message) tea.Cmd {
 			}
 			if toolMsgItem, ok := toolItem.(chat.ToolMessageItem); ok {
 				toolMsgItem.SetResult(&tr)
+				// Reopening a finished subagent puts it back to work, so
+				// its dispatch item has to start spinning again.
+				if tr.Name == agent.AgentSendToolName && tr.Metadata != "" {
+					var meta agent.AgentSendResponseMetadata
+					if json.Unmarshal([]byte(tr.Metadata), &meta) == nil && meta.Reopened {
+						m.markDispatchRunning(meta.Label)
+					}
+				}
 				if m.chat.Follow() {
 					m.chat.ScrollToBottom()
 				}
@@ -2018,26 +2189,11 @@ func (m *UI) handleChildSessionMessage(event pubsub.Event[message.Message]) tea.
 	// may have been frozen by a non-busy session reload.
 	m.chat.SetAnimationsAllowed(true)
 
-	// Find the parent agent tool item.
-	var agentItem chat.NestedToolContainer
-	for i := 0; i < m.chat.Len(); i++ {
-		item := m.chat.MessageItem(toolCallID)
-		if item == nil {
-			continue
-		}
-		if agent, ok := item.(chat.NestedToolContainer); ok {
-			if toolMessageItem, ok := item.(chat.ToolMessageItem); ok {
-				if toolMessageItem.ToolCall().ID == toolCallID {
-					// Verify this agent belongs to the correct parent message.
-					// We can't directly check parentMessageID on the item, so we trust the session parsing.
-					agentItem = agent
-					break
-				}
-			}
-		}
-	}
-
-	if agentItem == nil {
+	// Find the parent agent tool item. A nested tool's ID also maps to its
+	// parent, so the ID check keeps this to the item that owns the session.
+	item := m.chat.MessageItem(toolCallID)
+	agentItem, ok := item.(chat.NestedToolContainer)
+	if tool, isTool := item.(chat.ToolMessageItem); !ok || !isTool || tool.ToolCall().ID != toolCallID {
 		return nil
 	}
 
@@ -2168,8 +2324,11 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 				cmds = append(cmds, cmd)
 			}
 		} else {
-			m.toggleYoloMode()
+			cmds = append(cmds, m.toggleModeAndReport(permission.PermissionModeYolo))
 		}
+		m.dialog.CloseDialog(dialog.CommandsID)
+	case dialog.ActionToggleSysadminMode:
+		cmds = append(cmds, m.toggleModeAndReport(permission.PermissionModeSysadmin))
 		m.dialog.CloseDialog(dialog.CommandsID)
 	case dialog.ActionSelectNotificationStyle:
 		cfg := m.com.Config()
@@ -2254,24 +2413,18 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		}))
 		m.dialog.CloseDialog(dialog.CommandsID)
 	case dialog.ActionToggleTransparentBackground:
+		// Flip what is on screen, which a host theme may have overridden,
+		// rather than the config value.
+		newValue := !m.isTransparent
+		ws := m.com.Workspace
 		cmds = append(cmds, func() tea.Msg {
-			cfg := m.com.Config()
-			if cfg == nil {
+			if ws.Config() == nil {
 				return util.ReportError(errors.New("configuration not found"))()
 			}
-
-			isTransparent := cfg.Options != nil && cfg.Options.TUI.IsTransparent()
-			newValue := !isTransparent
-			if err := m.com.Workspace.SetConfigField(config.ScopeGlobal, "options.tui.transparent", newValue); err != nil {
+			if err := ws.SetConfigField(config.ScopeGlobal, "options.tui.transparent", newValue); err != nil {
 				return util.ReportError(err)()
 			}
-			m.isTransparent = newValue
-
-			status := "disabled"
-			if newValue {
-				status = "enabled"
-			}
-			return util.NewInfoMsg("Transparent background " + status)
+			return transparencyToggledMsg{transparent: newValue}
 		})
 		m.dialog.CloseDialog(dialog.CommandsID)
 	case dialog.ActionSwitchTheme:
@@ -2291,6 +2444,7 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		}
 		m.applyTheme(newStyles)
 		m.preThemeStyles = nil
+		m.userAppliedTheme()
 		cmds = append(cmds, util.ReportInfo("Theme switched to "+themeName))
 		m.userThemeSelected = true
 		m.dialog.CloseDialog(dialog.ThemeID)
@@ -2358,6 +2512,7 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 			}
 			m.applyTheme(newStyles)
 			m.preThemeStyles = nil
+			m.userAppliedTheme()
 		}
 		cmds = append(cmds, util.ReportInfo("Theme saved"))
 		m.dialog.CloseDialog(dialog.ThemeEditorID)
@@ -2386,6 +2541,10 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		if strings.EqualFold(common.ThemeNameFromConfig(m.com.Config()), msg.Name) {
 			if newStyles, err := styles.LoadTheme(msg.Name); err == nil {
 				m.applyTheme(newStyles)
+				// A preview snapshot holds the styles from before the
+				// revert; esc must not bring them back.
+				m.preThemeStyles = nil
+				m.userAppliedTheme()
 			}
 		}
 		cmds = append(cmds, util.ReportInfo("Reverted "+msg.Name+" to its built-in colors"))
@@ -2468,6 +2627,7 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 			}
 			m.applyTheme(newStyles)
 			m.preThemeStyles = nil
+			m.userAppliedTheme()
 		}
 		cmds = append(cmds, util.ReportInfo("Deleted theme "+msg.Name))
 		m.dialog.CloseDialog(dialog.ThemeID)
@@ -2558,6 +2718,19 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		case dialog.PermissionDeny:
 			m.com.Workspace.PermissionDeny(msg.Permission)
 		}
+
+	case dialog.ActionPinentrySubmit:
+		m.dialog.CloseDialog(dialog.PinentryID)
+		m.com.Workspace.PinentryRespond(msg.RequestID, msg.Secret)
+	case dialog.ActionPinentryCancel:
+		m.dialog.CloseDialog(dialog.PinentryID)
+		m.com.Workspace.PinentryCancel(msg.RequestID)
+	case dialog.ActionSSHSubmit:
+		m.dialog.CloseDialog(dialog.SSHID)
+		m.com.Workspace.SSHRespond(msg.RequestID, msg.Secret)
+	case dialog.ActionSSHCancel:
+		m.dialog.CloseDialog(dialog.SSHID)
+		m.com.Workspace.SSHCancel(msg.RequestID)
 
 	case dialog.ActionFilePickerSelected:
 		cmds = append(cmds, tea.Sequence(
@@ -3071,9 +3244,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			}
 		case key.Matches(msg, m.keyMap.Chat.EndFollow):
 			if m.state == uiChat && m.hasSession() {
-				if cmd := m.chat.ScrollToBottomAndSelectLast(); cmd != nil {
-					cmds = append(cmds, cmd)
-				}
+				m.chat.ScrollToBottomAndSelectLast()
 				return true
 			}
 		case key.Matches(msg, m.keyMap.Chat.TogglePills):
@@ -3113,8 +3284,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				}
 				return true
 			}
-			yolo := m.toggleYoloMode()
-			if yolo {
+			if m.toggleMode(permission.PermissionModeYolo) {
 				cmds = append(cmds, util.CmdHandler(util.InfoMsg{Type: util.InfoTypeYolo, Msg: yoloModeBannerMsg}))
 			} else {
 				cmds = append(cmds, util.ReportInfo("Yolo mode disabled"))
@@ -3215,7 +3385,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				}
 			}
 
-			if ok := m.attachments.Update(msg); ok {
+			if m.changeAttachments(func() bool { return m.attachments.Update(msg) }) {
 				return tea.Batch(cmds...)
 			}
 
@@ -3269,14 +3439,14 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 
 				if m.bangMode && value != "" {
 					m.bangMode = false
-					m.setEditorPrompt(m.yoloModeCached())
+					m.setEditorPrompt(m.permModeCached())
 					m.randomizePlaceholders()
 					m.historyReset()
 					return tea.Batch(m.runShellCommand(value))
 				}
 
 				attachments := m.attachments.List()
-				m.attachments.Reset()
+				m.changeAttachments(func() bool { m.attachments.Reset(); return true })
 				if len(value) == 0 && !message.ContainsTextAttachment(attachments) {
 					// Enter on an empty editor while a ready plan is pending
 					// reopens the dismissed handoff prompt.
@@ -3370,7 +3540,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				if m.bangMode && m.bangWasEmpty && msg.Code == tea.KeyBackspace {
 					m.bangMode = false
 					m.bangWasEmpty = false
-					m.setEditorPrompt(m.yoloModeCached())
+					m.setEditorPrompt(m.permModeCached())
 					break
 				}
 
@@ -3387,7 +3557,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 						m.completionsStartIndex = curIdx
 						m.completionsPositionStart = m.completionsPosition()
 						depth, limit := m.com.Config().Options.TUI.Completions.Limits()
-						cmds = append(cmds, m.completions.Open(depth, limit))
+						cmds = append(cmds, m.completions.Open(depth, limit, hostOpenFiles(m.com.Workspace)))
 					}
 				}
 
@@ -3419,7 +3589,7 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 					m.textarea.SetValue(stripped)
 					m.textarea.SetCursorColumn(max(0, col-(len(newVal)-len(stripped))))
 					_ = line // cursor line doesn't change; prefix removed
-					m.setEditorPrompt(m.yoloModeCached())
+					m.setEditorPrompt(m.permModeCached())
 				} else if m.bangMode && newVal == "" && curValue != "" {
 					// Just cleared last character; mark empty, stay in bang mode.
 					m.bangWasEmpty = true
@@ -3586,6 +3756,7 @@ func (m *UI) drawHeader(scr uv.Screen, area uv.Rectangle) {
 		m.lspErrorCount(),
 		m.hyperCredits,
 		m.gitBranch,
+		m.subAgentsRunning,
 	)
 }
 
@@ -3684,7 +3855,7 @@ func (m *UI) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 
 	// Add status and help layer
 	m.status.SetHideHelp(isOnboarding)
-	m.status.SetMode(m.mode, m.yoloModeCached())
+	m.status.SetMode(m.mode, m.permModeCached())
 	m.status.Draw(scr, layout.status)
 
 	// Draw completions popup if open
@@ -3788,8 +3959,7 @@ func (m *UI) View() tea.View {
 		if content, cursor, ok := m.frames.get(key); ok {
 			v.Content = content
 			v.Cursor = cursor
-			m.applyProgressBar(&v)
-			v.ProgramStatus = m.programStatus()
+			m.applyTerminalStatus(&v)
 			return v
 		}
 	}
@@ -3810,15 +3980,16 @@ func (m *UI) View() tea.View {
 	if cacheable {
 		m.storeFrame(key, content, v.Cursor)
 	}
-	m.applyProgressBar(&v)
-	v.ProgramStatus = m.programStatus()
+	m.applyTerminalStatus(&v)
 
 	return v
 }
 
-// applyProgressBar attaches the terminal progress bar while the agent is
-// busy. Kept outside the frame cache so the randomized value stays fresh.
-func (m *UI) applyProgressBar(v *tea.View) {
+// applyTerminalStatus attaches the program status, and the terminal progress
+// bar while the agent is busy. Kept outside the frame cache so the
+// randomized progress value stays fresh.
+func (m *UI) applyTerminalStatus(v *tea.View) {
+	v.ProgramStatus = m.programStatus()
 	if m.progressBarEnabled && m.sendProgressBar && m.isAgentBusy() {
 		// HACK: use a random percentage to prevent ghostty from hiding it
 		// after a timeout.
@@ -4148,7 +4319,46 @@ func (m *UI) currentModelSupportsImages() bool {
 		return false
 	}
 	model := cfg.GetModelByType(agentCfg.Model)
-	return model != nil && model.SupportsImages
+	return model != nil && model.Capabilities.Vision
+}
+
+func (m *UI) currentModelSupportsAudio() bool {
+	cfg := m.com.Config()
+	if cfg == nil {
+		return false
+	}
+	agentCfg, ok := cfg.Agents[config.AgentCoder]
+	if !ok {
+		return false
+	}
+	model := cfg.GetModelByType(agentCfg.Model)
+	return model != nil && model.Capabilities.Audio
+}
+
+// currentModelMaxAttachments returns the maximum number of attachments the
+// current model accepts in a single request. Zero means the provider does
+// not enforce a hard limit.
+func (m *UI) currentModelMaxAttachments() int {
+	cfg := m.com.Config()
+	if cfg == nil {
+		return 0
+	}
+	agentCfg, ok := cfg.Agents[config.AgentCoder]
+	if !ok {
+		return 0
+	}
+	model := cfg.GetModelByType(agentCfg.Model)
+	if model == nil {
+		return 0
+	}
+	return model.MaxAttachments
+}
+
+// attachmentsLimitReached reports whether the current model's attachment
+// limit is already exhausted by the pending attachments.
+func (m *UI) attachmentsLimitReached() bool {
+	max := m.currentModelMaxAttachments()
+	return max > 0 && len(m.attachments.List()) >= max
 }
 
 // toggleCompactMode toggles compact mode between uiChat and uiChatCompact states.
@@ -4488,14 +4698,16 @@ func (m *UI) generateLayout(w, h int) uiLayout {
 			// main  |
 			// ------| side
 			// editor|
-			// ----------
-			// help
+			// ------|
+			// help  |
 
 			var mainRect, sideRect image.Rectangle
 			layout.Horizontal(
 				layout.Len(appRect.Dx()-sidebarWidth),
 				layout.Fill(1),
 			).Split(appRect).Assign(&mainRect, &sideRect)
+			sideRect.Max.Y = helpRect.Max.Y - 1
+			uiLayout.status.Max.X = mainRect.Max.X
 			// Add padding left
 			sideRect.Min.X += 1
 			var editorRect image.Rectangle
@@ -4604,9 +4816,81 @@ func editorFileMsg(path string) tea.Msg {
 	}
 }
 
-// setEditorPrompt configures the textarea prompt function based on whether
-// plan, yolo, or bang mode is enabled.
-func (m *UI) setEditorPrompt(yolo bool) {
+// setPermissionMode writes mode to the workspace and through the
+// permission-mode cache (no re-probe needed), then refreshes the editor
+// prompt. Every permission-mode write goes through here, so the cache is
+// never left trailing the workspace.
+func (m *UI) setPermissionMode(mode permission.PermissionMode) {
+	m.com.Workspace.PermissionSetMode(mode)
+	m.permModeCache.set(mode)
+	// Supersede any in-flight busy/permission probe: its result carries the
+	// old generation and would otherwise overwrite the value we just wrote.
+	// Bump the generation (rather than invalidateBusyCaches, which would
+	// clear the fresh value) so applyBusyState's guard discards and
+	// re-dispatches the stale probe.
+	m.busyFetchGen++
+	m.setEditorPrompt(mode)
+}
+
+// setYolo turns YOLO on or off. Turning it off goes all the way back to
+// normal, so a sysadmin session that declines YOLO really does get its
+// prompts back rather than landing one rung down.
+func (m *UI) setYolo(on bool) {
+	mode := permission.PermissionModeNormal
+	if on {
+		mode = permission.PermissionModeYolo
+	}
+	m.setPermissionMode(mode)
+}
+
+// toggleMode flips the permission mode between target and Normal. It reports
+// whether target is now the active mode.
+func (m *UI) toggleMode(target permission.PermissionMode) (enabled bool) {
+	mode := permission.PermissionModeNormal
+	if m.com.Workspace.PermissionMode() != target {
+		mode = target
+		enabled = true
+	}
+	m.setPermissionMode(mode)
+	return enabled
+}
+
+// permissionModeName is the human-readable name for a permission mode.
+func permissionModeName(mode permission.PermissionMode) string {
+	switch mode {
+	case permission.PermissionModeYolo:
+		return "yolo"
+	case permission.PermissionModeSysadmin:
+		return "sysadmin"
+	default:
+		return "normal"
+	}
+}
+
+// toggleModeAndReport flips the permission mode and announces where it
+// landed. Reaching a mode from the command palette shows the same badge
+// banner as reaching it from the Shift+Tab cycle, so one mode does not
+// announce itself two different ways depending on the road in. Dropping
+// back to normal is ordinary news and reads as such: it names the mode
+// rather than saying "disabled", which is a lie when the toggle landed
+// somewhere rather than switching something off.
+func (m *UI) toggleModeAndReport(target permission.PermissionMode) tea.Cmd {
+	if !m.toggleMode(target) {
+		return util.ReportInfo("Permission mode: " + permissionModeName(permission.PermissionModeNormal))
+	}
+	switch target {
+	case permission.PermissionModeSysadmin:
+		return util.CmdHandler(util.InfoMsg{Type: util.InfoTypeSysadmin, Msg: sysadminModeBannerMsg})
+	case permission.PermissionModeYolo:
+		return util.CmdHandler(util.InfoMsg{Type: util.InfoTypeYolo, Msg: yoloModeBannerMsg})
+	default:
+		return util.ReportInfo("Permission mode: " + permissionModeName(target))
+	}
+}
+
+// setEditorPrompt configures the textarea prompt function based on the current
+// permission mode, or whether plan or bang mode is enabled.
+func (m *UI) setEditorPrompt(mode permission.PermissionMode) {
 	if m.bangMode {
 		m.textarea.SetPromptFunc(4, m.bangPromptFunc)
 		return
@@ -4615,11 +4899,14 @@ func (m *UI) setEditorPrompt(yolo bool) {
 		m.textarea.SetPromptFunc(4, m.planPromptFunc)
 		return
 	}
-	if yolo {
+	switch mode {
+	case permission.PermissionModeSysadmin:
+		m.textarea.SetPromptFunc(4, m.sysadminPromptFunc)
+	case permission.PermissionModeYolo:
 		m.textarea.SetPromptFunc(4, m.yoloPromptFunc)
-		return
+	default:
+		m.textarea.SetPromptFunc(4, m.normalPromptFunc)
 	}
-	m.textarea.SetPromptFunc(4, m.normalPromptFunc)
 }
 
 // normalPromptFunc returns the normal editor prompt style ("> " on the
@@ -4686,23 +4973,33 @@ func (m *UI) bangPromptFunc(info textarea.PromptInfo) string {
 	return t.Editor.PromptBangDotsBlurred.Render()
 }
 
+// toggleInputMode advances the Shift+Tab cycle by one position. The cycle is
+// a ring of four positions read straight off the current state — code ->
+// plan -> YOLO -> sysadmin -> code. Nothing is remembered between presses,
+// so the next position is always the one the badge implies, whether the
+// permission mode came from this cycle or from Ctrl+Y.
 func (m *UI) toggleInputMode() tea.Cmd {
 	if m.isAgentBusy() || m.modeSwitching {
 		return util.ReportWarn("Agent is busy, please wait before switching input mode...")
 	}
 	if m.mode == uiInputModePlan {
-		// Second step of the Shift+Tab cycle: plan -> YOLO. Enabling YOLO
-		// here is the only case where the cycle may disable it again.
-		if !m.com.Workspace.PermissionSkipRequests() {
-			m.toggleYoloMode()
-			m.cycleYolo = true
+		// Second step: plan -> YOLO coding. A permissive mode carried into
+		// plan keeps its rung rather than being knocked down to plain YOLO.
+		if !m.yoloActive() {
+			m.setYolo(true)
 		}
 		return m.setInputMode(uiInputModeCode)
 	}
-	// Only the cycle may turn YOLO back off: YOLO the user enabled himself
-	// (Ctrl+Y, the command palette) survives entering plan mode.
-	if m.com.Workspace.PermissionSkipRequests() && m.cycleYolo {
-		m.toggleYoloMode()
+	if m.yoloActive() {
+		if m.permModeCached() == permission.PermissionModeYolo {
+			// Third step: YOLO -> sysadmin. The banner spells out what was
+			// just given up, since this is the most permissive state the
+			// program has and it is now one keystroke away.
+			m.setPermissionMode(permission.PermissionModeSysadmin)
+			return util.CmdHandler(util.InfoMsg{Type: util.InfoTypeSysadmin, Msg: sysadminModeBannerMsg})
+		}
+		// Fourth step: sysadmin -> normal, closing the cycle.
+		m.setYolo(false)
 		return util.ReportInfo("input mode: code")
 	}
 	return m.setInputMode(uiInputModePlan)
@@ -4717,19 +5014,19 @@ func (m *UI) switchPlanToYolo() tea.Cmd {
 	if m.isAgentBusy() || m.modeSwitching {
 		return util.ReportWarn("Agent is busy, please wait before switching input mode...")
 	}
-	if !m.com.Workspace.PermissionSkipRequests() {
-		m.toggleYoloMode()
+	// Idempotent by design: a sysadmin session carried into plan mode keeps
+	// its mode rather than being knocked down to plain YOLO.
+	if !m.yoloActive() {
+		m.setYolo(true)
 	}
-	// Explicit activation pins YOLO: the Shift+Tab cycle must not disable
-	// it on the next pass.
-	m.cycleYolo = false
 	return m.setInputMode(uiInputModeCode)
 }
 
 // Mode banner copy shown in the status bar after switching modes.
 const (
-	planModeBannerMsg = "Plan with Crush before generating any code."
-	yoloModeBannerMsg = "Skip permission prompts. System level commands will be blocked."
+	planModeBannerMsg     = "Plan with Crush before generating any code."
+	yoloModeBannerMsg     = "System level commands stay blocked. The rest run unprompted."
+	sysadminModeBannerMsg = "All commands are unblocked. Use wisely."
 )
 
 func (m *UI) setInputMode(target uiInputMode) tea.Cmd {
@@ -4738,9 +5035,13 @@ func (m *UI) setInputMode(target uiInputMode) tea.Cmd {
 		agentID = config.AgentCoder
 	}
 
-	// YOLO is orthogonal to the input mode, so report it alongside the mode
-	// instead of treating a YOLO-enabled coder as plain "code".
-	yolo := target == uiInputModeCode && m.com.Workspace.PermissionSkipRequests()
+	// The permission mode is orthogonal to the input mode, so report it
+	// alongside the mode instead of treating a YOLO-enabled coder as plain
+	// "code".
+	perm := permission.PermissionModeNormal
+	if target == uiInputModeCode {
+		perm = m.permModeCached()
+	}
 
 	// The agent switch is an HTTP round-trip in client/server mode, so it
 	// runs off the update loop together with the model update. The mode and
@@ -4755,7 +5056,7 @@ func (m *UI) setInputMode(target uiInputMode) tea.Cmd {
 		}
 		return modeSwitchedMsg{
 			mode: target,
-			yolo: yolo,
+			perm: perm,
 			err:  err,
 		}
 	}
@@ -4769,7 +5070,7 @@ func (m *UI) applyModeSwitch(msg modeSwitchedMsg) []tea.Cmd {
 		return []tea.Cmd{util.ReportError(msg.err)}
 	}
 	m.mode = msg.mode
-	m.setEditorPrompt(m.yoloModeCached())
+	m.setEditorPrompt(m.permModeCached())
 	var cmds []tea.Cmd
 	if msg.continueSessionID != "" && m.session != nil && m.session.ID == msg.continueSessionID {
 		cmds = append(cmds, m.sendMessageInternal("Implement the plan.", true))
@@ -4777,7 +5078,9 @@ func (m *UI) applyModeSwitch(msg modeSwitchedMsg) []tea.Cmd {
 	switch {
 	case msg.mode == uiInputModePlan:
 		cmds = append(cmds, util.CmdHandler(util.InfoMsg{Type: util.InfoTypePlan, Msg: planModeBannerMsg}))
-	case msg.yolo:
+	case msg.perm == permission.PermissionModeSysadmin:
+		cmds = append(cmds, util.CmdHandler(util.InfoMsg{Type: util.InfoTypeSysadmin, Msg: sysadminModeBannerMsg}))
+	case msg.perm == permission.PermissionModeYolo:
 		cmds = append(cmds, util.CmdHandler(util.InfoMsg{Type: util.InfoTypeYolo, Msg: yoloModeBannerMsg}))
 	default:
 		cmds = append(cmds, util.ReportInfo("input mode: code"))
@@ -4790,8 +5093,25 @@ func (m *UI) applyModeSwitch(msg modeSwitchedMsg) []tea.Cmd {
 type modeSwitchedMsg struct {
 	continueSessionID string
 	mode              uiInputMode
-	yolo              bool
+	perm              permission.PermissionMode
 	err               error
+}
+
+// sysadminPromptFunc returns the sysadmin mode editor prompt style with red
+// warning icon and red dots.
+func (m *UI) sysadminPromptFunc(info textarea.PromptInfo) string {
+	t := m.com.Styles
+	if info.LineNumber == 0 {
+		if info.Focused {
+			return t.Editor.PromptSysadminIconFocused.Render()
+		} else {
+			return t.Editor.PromptSysadminIconBlurred.Render()
+		}
+	}
+	if info.Focused {
+		return t.Editor.PromptSysadminDotsFocused.Render()
+	}
+	return t.Editor.PromptSysadminDotsBlurred.Render()
 }
 
 // closeCompletions closes the completions popup and resets state.
@@ -4831,6 +5151,9 @@ func (m *UI) insertFileCompletion(path string) tea.Cmd {
 	fileCmd := func() tea.Msg {
 		if !m.currentModelSupportsImages() && common.IsImagePath(path) {
 			return util.NewWarnMsg("The current model does not support image attachments")
+		}
+		if !m.currentModelSupportsAudio() && common.IsAudioPath(path) {
+			return util.NewWarnMsg("The current model does not support audio attachments")
 		}
 
 		absPath, _ := filepath.Abs(path)
@@ -4912,6 +5235,9 @@ func (m *UI) insertMCPResourceCompletion(item completions.ResourceCompletionValu
 
 		if !m.currentModelSupportsImages() && strings.HasPrefix(mimeType, "image/") {
 			return util.NewWarnMsg("The current model does not support image attachments")
+		}
+		if !m.currentModelSupportsAudio() && strings.HasPrefix(mimeType, "audio/") {
+			return util.NewWarnMsg("The current model does not support audio attachments")
 		}
 
 		return message.Attachment{
@@ -5026,7 +5352,9 @@ func (m *UI) cacheSidebarLogo(width int) {
 // invalidating the markdown renderer cache and re-rendering the entire
 // transcript for no visible change.
 // A theme explicitly selected in the config always wins, so provider
-// changes never discard the user's choice.
+// changes never discard the user's choice. An active host theme wins too:
+// the provider's theme is only recorded, to revert to once the host clears
+// its theme.
 func (m *UI) applyThemeForProvider(providerID string) {
 	// A theme the user explicitly selected always wins over the
 	// per-provider default, so provider or session changes never discard
@@ -5040,7 +5368,10 @@ func (m *UI) applyThemeForProvider(providerID string) {
 		return
 	}
 	m.themeKey = key
-	m.applyTheme(styles.ThemeForProvider(providerID))
+	if m.hostTheme.active {
+		return
+	}
+	m.applyTheme(styles.ThemeForKey(key))
 }
 
 // applyTheme replaces the active styles with the given theme, drops the
@@ -5079,10 +5410,9 @@ func (m *UI) refreshStyles() {
 	m.attachments.SetStyles(t.Attachments)
 	m.todoSpinner.Style = t.Pills.TodoSpinner
 	m.status.help.Styles = t.Help
-	if d := m.dialog.Dialog(dialog.ThemeID); d != nil {
-		if td, ok := d.(*dialog.Theme); ok {
-			td.RefreshStyles()
-		}
+	m.dialog.RefreshStyles()
+	if r, ok := m.activeInline.(dialog.StyleRefresher); ok {
+		r.RefreshStyles()
 	}
 }
 
@@ -5177,11 +5507,9 @@ func (m *UI) sendMessageInternal(content string, hidden bool, attachments ...mes
 		return util.ReportError(err)
 	}
 
-	// Start the turn timer.
-	common.StartTurn()
-
 	// Any new prompt supersedes a pending, unconfirmed plan.
 	m.setPlanReadyPending("")
+	m.turnOutcome = ""
 
 	var cmds []tea.Cmd
 	loadCmd, err := m.ensureSession()
@@ -5190,6 +5518,24 @@ func (m *UI) sendMessageInternal(content string, hidden bool, attachments ...mes
 	}
 	if loadCmd != nil {
 		cmds = append(cmds, loadCmd)
+	}
+
+	// A queued prompt belongs in the queue pill and keeps the running
+	// turn's spinner and clock. A fresh turn gets its own, from now.
+	sessionID := m.currentSessionID()
+	queued := m.turnInFlight(sessionID)
+	// Loading an idle session freezes ghost spinners; sending unfreezes.
+	m.chat.SetAnimationsAllowed(true)
+	if !queued {
+		common.StartTurn(sessionID)
+		echo := content
+		echoAttachments := attachments
+		if hidden {
+			echo, echoAttachments = "", nil
+		}
+		if m.showPendingTurn(sessionID, echo, echoAttachments) {
+			m.chat.ScrollToBottom()
+		}
 	}
 
 	ctx := context.Background()
@@ -5201,8 +5547,8 @@ func (m *UI) sendMessageInternal(content string, hidden bool, attachments ...mes
 		return nil
 	})
 
-	// Capture session ID to avoid race with main goroutine updating m.session.
-	sessionID := m.session.ID
+	// sessionID is captured above, before the commands below run, so it
+	// cannot race the main goroutine updating m.session.
 	// Optimistically mark the agent busy: the prompt we are about to submit
 	// either starts a run or is enqueued behind one. This keeps esc pressed
 	// right after enter routing to cancelAgent instead of reading a stale
@@ -5222,13 +5568,10 @@ func (m *UI) sendMessageInternal(content string, hidden bool, attachments ...mes
 			runCtx = message.WithHiddenUserMessage(runCtx)
 		}
 		err := m.com.Workspace.AgentRun(runCtx, sessionID, content, attachments...)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			return util.InfoMsg{
-				Type: util.InfoTypeError,
-				Msg:  fmt.Sprintf("%v", err),
-			}
+		if errors.Is(err, context.Canceled) {
+			err = nil
 		}
-		return agentRunSubmittedMsg{}
+		return agentRunSubmittedMsg{sessionID: sessionID, err: err}
 	})
 	return tea.Batch(cmds...)
 }
@@ -5345,6 +5688,7 @@ func (m *UI) runShellCommandInternal(command string, isFirstMessage bool) tea.Cm
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.bangCancel = cancel
+	m.turnOutcome = ""
 
 	cmds = append(cmds, func() tea.Msg {
 		resp, err := m.com.Workspace.AgentRunShellCommand(ctx, sessionID, command, contentWidth, onProgress, isFirstMessage)
@@ -5489,7 +5833,7 @@ func (m *UI) openQuitDialog() tea.Cmd {
 		return nil
 	}
 
-	quitDialog := dialog.NewQuit(m.com)
+	quitDialog := dialog.NewQuit(m.com, m.runningSubAgents())
 	m.dialog.OpenDialog(quitDialog)
 	return nil
 }
@@ -5529,7 +5873,7 @@ func (m *UI) openCommandsDialog() tea.Cmd {
 	hasTodos := hasSession && hasIncompleteTodos(m.session.Todos)
 	hasQueue := m.promptQueue > 0
 
-	commands, err := dialog.NewCommands(m.com, sessionID, hasSession, hasTodos, hasQueue, m.customCommands, m.mcpPrompts)
+	commands, err := dialog.NewCommands(m.com, sessionID, hasSession, hasTodos, hasQueue, m.isTransparent, m.customCommands, m.mcpPrompts)
 	if err != nil {
 		return util.ReportError(err)
 	}
@@ -5612,6 +5956,11 @@ func (m *UI) openFilesDialog() tea.Cmd {
 
 // openPermissionsDialog opens the permissions dialog for a permission request.
 func (m *UI) openPermissionsDialog(perm permission.PermissionRequest) tea.Cmd {
+	// CRUSH_PERMISSIONS_PIPED=1: another client (an editor Crush runs in)
+	// shows the prompts and answers them, so this UI doesn't ask twice.
+	if piped, _ := strconv.ParseBool(os.Getenv("CRUSH_PERMISSIONS_PIPED")); piped {
+		return nil
+	}
 	// Close any existing permissions dialog first.
 	m.dialog.CloseDialog(dialog.PermissionsID)
 
@@ -5693,7 +6042,7 @@ func (m *UI) handlePermissionNotification(notification permission.PermissionNoti
 		if permItem, ok := toolItem.(chat.ToolMessageItem); ok {
 			if notification.Granted {
 				permItem.SetStatus(chat.ToolStatusRunning)
-			} else {
+			} else if !notification.Cancelled {
 				permItem.SetStatus(chat.ToolStatusAwaitingPermission)
 			}
 		}
@@ -5702,7 +6051,7 @@ func (m *UI) handlePermissionNotification(notification permission.PermissionNoti
 	// If this notification reflects a final resolution (granted or denied),
 	// dismiss any open permissions dialog whose tool call ID matches. This
 	// covers the case where another client resolved the request remotely.
-	if !notification.Granted && !notification.Denied {
+	if !notification.Granted && !notification.Denied && !notification.Cancelled {
 		return
 	}
 	if d := m.dialog.Dialog(dialog.PermissionsID); d != nil {
@@ -5770,8 +6119,10 @@ func (m *UI) setPlanReadyPending(sessionID string) {
 func (m *UI) openPlanHandoff() {
 	inline := dialog.NewPlanHandoffInline(m.com)
 	inline.OnConfirm = func(yolo bool) tea.Cmd {
-		if m.com.Workspace.PermissionSkipRequests() != yolo {
-			m.toggleYoloMode()
+		// The handoff asks a yes/no question about YOLO, so answer it
+		// literally: declining drops the session back to normal.
+		if m.yoloActive() != yolo {
+			m.setYolo(yolo)
 		}
 		m.setPlanReadyPending("")
 		sessionID := m.session.ID
@@ -5803,8 +6154,6 @@ func (m *UI) handleAgentNotification(n notify.Notification) tea.Cmd {
 	var cmds []tea.Cmd
 	switch n.Type {
 	case notify.TypeAgentFinished:
-		common.StopTurn()
-		m.turnOutcome = tea.ProgramStateDone
 		cmds = append(cmds, m.sendNotification(notification.Notification{
 			Title:   "Crush is waiting...",
 			Message: fmt.Sprintf("Agent's turn completed in \"%s\"", n.SessionTitle),
@@ -5817,9 +6166,9 @@ func (m *UI) handleAgentNotification(n notify.Notification) tea.Cmd {
 			cmds = append(cmds, m.fetchHyperCredits())
 		}
 	case notify.TypeAgentError:
-		m.turnOutcome = tea.ProgramStateError
 		// Terminal edge like TypeAgentFinished; fall through to the
 		// busy/queue refresh below.
+		m.endPendingTurn(n.SessionID)
 	case notify.TypeReAuthenticate:
 		return m.handleReAuthenticate(n.ProviderID)
 	case notify.TypeAWSSSOAuth:
@@ -5912,6 +6261,7 @@ func (m *UI) newSession() tea.Cmd {
 	}
 
 	planCmd := m.resetPlanModeState()
+	m.turnOutcome = ""
 	m.session = nil
 	m.sidebarOffset = 0
 	m.sessionFiles = nil
@@ -5959,7 +6309,7 @@ func (m *UI) checkBangModeAfterPaste() {
 	m.textarea.SetValue(stripped)
 	col := m.textarea.Column()
 	m.textarea.SetCursorColumn(max(0, col-(len(val)-len(stripped))))
-	m.setEditorPrompt(m.yoloModeCached())
+	m.setEditorPrompt(m.permModeCached())
 }
 
 // handlePasteMsg handles a paste message.
@@ -6005,7 +6355,7 @@ func (m *UI) handlePasteMsg(msg tea.PasteMsg) tea.Cmd {
 			if _, err := os.Stat(path); os.IsNotExist(err) {
 				return false
 			}
-			if !common.IsImagePath(path) {
+			if !common.IsImagePath(path) && !common.IsAudioPath(path) {
 				return false
 			}
 		}
@@ -6017,8 +6367,11 @@ func (m *UI) handlePasteMsg(msg tea.PasteMsg) tea.Cmd {
 		m.checkBangModeAfterPaste()
 		return cmd
 	}
-	if !m.currentModelSupportsImages() {
+	if !m.currentModelSupportsImages() && slices.ContainsFunc(paths, common.IsImagePath) {
 		return util.ReportWarn("The current model does not support image attachments")
+	}
+	if !m.currentModelSupportsAudio() && slices.ContainsFunc(paths, common.IsAudioPath) {
+		return util.ReportWarn("The current model does not support audio attachments")
 	}
 
 	var cmds []tea.Cmd
@@ -6203,14 +6556,25 @@ func (m *UI) drawSessionDetails(scr uv.Screen, area uv.Rectangle) {
 	remainingHeight := height - lipgloss.Height(detailsHeader) - lipgloss.Height(version)
 
 	const maxSectionWidth = 50
-	sectionWidth := max(1, min(maxSectionWidth, width/4-2)) // account for spacing between sections
-	maxItemsPerSection := remainingHeight - 3               // Account for section title and spacing
+	// Subagents take the leading column when any exist, since a running
+	// subagent is the one thing here that changes while you watch.
+	subAgents := m.subAgentStatuses()
+	columns := 4
+	if len(subAgents) > 0 {
+		columns++
+	}
+	sectionWidth := max(1, min(maxSectionWidth, (width-(columns-1))/columns)) // one space between columns
+	maxItemsPerSection := max(0, remainingHeight-3)                           // Account for section title and spacing
 
 	lspSection := m.lspInfo(sectionWidth, maxItemsPerSection, false)
 	mcpSection := m.mcpInfo(sectionWidth, maxItemsPerSection, false)
 	skillsSection := m.skillsInfo(sectionWidth, maxItemsPerSection, false)
 	filesSection := m.filesInfo(m.com.Workspace.WorkingDir(), sectionWidth, maxItemsPerSection, false)
 	sections := lipgloss.JoinHorizontal(lipgloss.Top, filesSection, " ", lspSection, " ", mcpSection, " ", skillsSection)
+	if len(subAgents) > 0 {
+		sections = lipgloss.JoinHorizontal(lipgloss.Top, m.subAgentsInfo(subAgents, sectionWidth, maxItemsPerSection, false), " ", sections)
+	}
+	sections = lipgloss.NewStyle().MaxWidth(width).MaxHeight(max(0, remainingHeight)).Render(sections)
 	uv.NewStyledString(
 		s.CompactDetails.View.
 			Width(area.Dx()).
@@ -6328,4 +6692,35 @@ func renderLogo(t *styles.Styles, compact, hyper bool, width int) string {
 		Width:        width,
 		Hyper:        hyper,
 	})
+}
+
+// markDispatchRunning puts the dispatch item for this label back into its
+// working state after its subagent was reopened with a follow-up. A label
+// can be reused, and only its latest dispatch is the one reopened.
+func (m *UI) markDispatchRunning(label string) {
+	if label == "" {
+		return
+	}
+	for i := m.chat.Len() - 1; i >= 0; i-- {
+		item, ok := m.chat.MessageItemAt(i).(*chat.AgentToolMessageItem)
+		if ok && item.DispatchLabel() == label {
+			item.MarkDispatchRunning()
+			break
+		}
+	}
+	m.chat.SetAnimationsAllowed(true)
+}
+
+// markDispatchReported stops the spinner on the agent_dispatch item that
+// launched the subagent with this label.
+func (m *UI) markDispatchReported(label string) {
+	if label == "" {
+		return
+	}
+	for i := range m.chat.Len() {
+		item, ok := m.chat.MessageItemAt(i).(*chat.AgentToolMessageItem)
+		if ok && item.DispatchLabel() == label {
+			item.MarkDispatchReported()
+		}
+	}
 }

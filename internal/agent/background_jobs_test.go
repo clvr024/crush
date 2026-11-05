@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/crush/internal/agent/tools"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/stretchr/testify/require"
@@ -18,7 +19,7 @@ func TestBackgroundJobsFollowUpAndCollectResult(t *testing.T) {
 	t.Parallel()
 
 	manager := shell.GetBackgroundShellManager()
-	job, err := manager.Start(t.Context(), t.TempDir(), nil, "echo done", "Build")
+	job, err := manager.Start(t.Context(), t.TempDir(), nil, "echo done", "Build", config.DefaultMaxBackgroundJobs)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = manager.Kill(job.ID) })
 	job.Wait()
@@ -71,7 +72,7 @@ func TestBackgroundJobsCancelFollowUp(t *testing.T) {
 	t.Parallel()
 
 	manager := shell.GetBackgroundShellManager()
-	job, err := manager.Start(t.Context(), t.TempDir(), nil, "sleep 10", "Test")
+	job, err := manager.Start(t.Context(), t.TempDir(), nil, "sleep 10", "Test", config.DefaultMaxBackgroundJobs)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = manager.Kill(job.ID) })
 	tracker := &backgroundJobTracker{jobs: map[string]int{job.ID: 0}}
@@ -86,7 +87,7 @@ func TestBackgroundJobsBoundIgnoredReminders(t *testing.T) {
 	t.Parallel()
 
 	manager := shell.GetBackgroundShellManager()
-	job, err := manager.Start(t.Context(), t.TempDir(), nil, "echo done", "Build")
+	job, err := manager.Start(t.Context(), t.TempDir(), nil, "echo done", "Build", config.DefaultMaxBackgroundJobs)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = manager.Kill(job.ID) })
 	job.Wait()
