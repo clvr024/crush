@@ -47,6 +47,11 @@ jobs:
           fi
           # HEAD is still the fork commit, including intentionally deleted
           # workflows. Restoring it also resolves workflow-only conflicts.
+          while IFS= read -r -d '' workflow; do
+            if ! git cat-file -e "HEAD:$workflow" 2>/dev/null; then
+              git rm -- "$workflow"
+            fi
+          done < <(git diff --name-only --diff-filter=U -z -- .github/workflows)
           git restore --source=HEAD --staged --worktree -- .github/workflows
           conflicts="$(git diff --name-only --diff-filter=U)"
           if [[ -n "$conflicts" ]]; then
