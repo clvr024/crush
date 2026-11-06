@@ -37,12 +37,31 @@ jobs:
             fi
             exit 0
           fi
-          git merge --no-edit upstream/main
-          # Keep the fork's workflows so GITHUB_TOKEN can push the merge.
-          if ! git diff --quiet HEAD^1 HEAD -- .github/workflows; then
-            git restore --source=HEAD^1 --staged --worktree -- .github/workflows
-            git commit --amend --no-edit
+          # Pause before committing so fork workflows can be restored even
+          # when upstream changes cause conflicts in that directory.
+          if ! git merge --no-commit --no-ff upstream/main; then
+            if ! git rev-parse --quiet --verify MERGE_HEAD > /dev/null; then
+              echo "::error::Could not start the upstream merge."
+              exit 1
+            fi
           fi
+          # HEAD is still the fork commit, including intentionally deleted
+          # workflows. Restoring it also resolves workflow-only conflicts.
+          git restore --source=HEAD --staged --worktree -- .github/workflows
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          if [[ -n "$conflicts" ]]; then
+            echo "::error::Upstream merge has conflicts outside .github/workflows."
+            printf '%s\n' "$conflicts"
+            {
+              echo "## Upstream merge needs manual resolution"
+              echo
+              echo '```text'
+              printf '%s\n' "$conflicts"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          git commit -m "chore: merge upstream main"
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
 
