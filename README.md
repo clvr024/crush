@@ -1,3 +1,125 @@
+# Crush · 面向开发与服务器运维的终端 AI 助手
+
+[![Release](https://img.shields.io/github/v/release/clvr024/crush)](https://github.com/clvr024/crush/releases/latest)
+[![Build](https://github.com/clvr024/crush/actions/workflows/build.yml/badge.svg)](https://github.com/clvr024/crush/actions/workflows/build.yml)
+[![Sync upstream and release](https://github.com/clvr024/crush/actions/workflows/upstream-sync.yml/badge.svg)](https://github.com/clvr024/crush/actions/workflows/upstream-sync.yml)
+
+这是 [charmbracelet/crush](https://github.com/charmbracelet/crush) 的个人维护分支，围绕日常编程和服务器使用中的实际问题做小幅改进：减少重复探索，让任务进度更清楚，让终端界面更多地展示问题和结论。改动尽量保持局部，便于持续合并上游更新。
+
+保留上游的多模型切换、项目会话、LSP 代码上下文、MCP 扩展和技能支持，可连接 Gemini、OpenAI、Anthropic 等服务以及兼容 API。
+
+[下载安装](#下载安装) · [快速开始](#快速开始) · [权限模式](#权限模式) · [配置参考](docs/config/README.md) · [构建与发布](#构建与发布)
+
+## 本分支的主要改进
+
+| 使用中的问题 | 本分支的处理方式 |
+| --- | --- |
+| 反复读同一个文件，或把文件拆成很多小段读取 | 文件工具默认读取 1,000 行，内容上限为 200 KB；提示模型先定位再读取大文件，并检测重复搜索、重复读取及高度重叠的读取，必要时返回调整方向的提示。 |
+| 已有发现却迟迟不反馈 | 加强沟通提示，要求模型及时说明线索、可能原因、阻塞点，以及耗时操作的目的和状态。 |
+| 命令转入后台后缺少跟进 | Bash 默认在运行 60 秒后转为后台任务，返回任务 ID 和后续查询指引，提醒模型收集输出和最终退出状态。 |
+| 工具输出占满对话 | 工具调用默认显示一行摘要，连续工具之间去掉空行，需要时展开详情。 |
+| 长会话上下滚动卡顿 | 缓存消息起始行位置，减少滚动时的重复遍历。 |
+| 命令结果状态不准确、短任务额外等待 | 修正 Bash 失败状态和后台任务完成状态；显式后台执行的短命令完成后立即返回结果。 |
+
+重复调用检测和工具状态处理由代码实现；进度反馈与后续操作也依赖所选模型对提示的遵循程度。
+
+## 下载安装
+
+从本仓库的 **[最新 Release](https://github.com/clvr024/crush/releases/latest)** 下载对应系统和架构的安装包：
+
+| 系统 | 架构 | 格式 |
+| --- | --- | --- |
+| Linux | amd64 / arm64 | `.tar.gz` |
+| macOS | amd64 / arm64 | `.tar.gz` |
+| Windows | amd64 / arm64 | `.zip` |
+
+Release 同时提供 `checksums.txt`，可用于校验下载文件。常见 Intel / AMD 电脑选择 `amd64`，Apple Silicon 和 ARM 服务器选择 `arm64`。
+
+Linux / macOS 解压后，在解压目录执行：
+
+```bash
+chmod +x crush
+./crush --version
+./crush
+```
+
+如需在任意目录使用，可将可执行文件放入 `PATH`，例如：
+
+```bash
+sudo install -m 0755 crush /usr/local/bin/crush
+```
+
+Windows 解压后，在 PowerShell 中进入解压目录执行：
+
+```powershell
+.\crush.exe --version
+.\crush.exe
+```
+
+也可以把解压目录加入 `PATH`，之后直接使用 `crush`。下方上游参考中的 Homebrew、npm、Winget、Scoop 等命令安装的是上游版本；获取本分支改动请使用本仓库的 Release。
+
+## 快速开始
+
+在项目目录启动 `crush`，按界面提示配置服务商和 API Key；也可使用 `Ctrl+L` 选择或切换模型。
+
+```bash
+# 在当前目录开始会话。
+crush
+
+# 指定项目或运维工作目录。
+crush --cwd /path/to/project
+
+# 继续最近一次会话。
+crush --continue
+
+# 非交互运行，适合脚本或没有交互终端的环境。
+crush run "检查当前目录的项目结构，说明主要入口"
+```
+
+工具调用默认折叠为一行，点击可展开或收起。键盘操作时，按 `Tab` 聚焦对话区域，用 `Shift+↑/↓` 在消息间移动，按 `Space` 展开或收起；`Ctrl+P` 打开命令菜单。
+
+耗时命令转入后台表示命令仍在执行。工具会返回后台任务 ID，模型可通过 `job_output` 查询输出与退出状态；仅在需要终止时使用 `job_kill`。
+
+## 权限模式
+
+| 启动方式 | 行为 |
+| --- | --- |
+| `crush` | 普通模式：安全的读取可直接执行，其他操作按权限规则请求确认。 |
+| `crush -y` | YOLO 模式：自动批准权限请求，保留执行时的命令阻止列表。 |
+| `crush -yy` | Sysadmin 模式：自动批准权限请求，同时关闭执行时的命令阻止列表。 |
+
+`-y` 也会自动批准在权限检查阶段识别出的危险命令，不能视为安全沙箱。`-yy` 适合你明确授权操作的可信环境，它不会提升系统权限，命令仍以当前操作系统用户身份执行。
+
+客户端连接已有服务端工作区时，权限模式由首次创建工作区的设置决定，后续客户端的启动参数不一定会改变该模式。
+
+## 配置与扩展
+
+推荐使用 `crushrc`，通过 Bash 语法配置模型、服务商、MCP、LSP、权限和 Hooks。项目配置可以使用 `.crushrc` 或 `crushrc`；默认全局配置位置为：
+
+- Linux / macOS：`~/.config/crush/crushrc`
+- Windows：`%USERPROFILE%\.config\crush\crushrc`
+
+设置了 `XDG_CONFIG_HOME` 时，配置路径随之调整。旧的 `crush.json` 仍然受支持，但已弃用，推荐逐步迁移到 `crushrc`。运行 `crush dirs` 可查看实际使用的配置和数据目录。
+
+- [完整配置参考](docs/config/README.md)：服务商、模型、MCP、LSP、权限及旧配置迁移。
+- [Hooks 文档](docs/hooks/README.md)：工具执行前的自定义检查与处理。
+- 项目规则可放在 `AGENTS.md`、`CRUSH.md`、`CLAUDE.md` 或 `GEMINI.md` 中，作为模型的项目上下文。
+
+## 构建与发布
+
+向 `main` 推送或提交 PR 后，[Build 工作流](https://github.com/clvr024/crush/actions/workflows/build.yml)会在 Linux、macOS 和 Windows 上执行构建与测试。**推送代码本身不会创建 Release。**
+
+需要生成安装包时，在 GitHub Actions 中手动运行 [Sync upstream and release](https://github.com/clvr024/crush/actions/workflows/upstream-sync.yml)。该流程会检查并合并上游、运行测试，通过后推送版本标签并发布安装包；手动运行时，即使没有上游更新也会请求发布。版本号采用 `v上游版本+fork.流程运行号` 的形式。
+
+该流程也按计划每天检查上游（UTC 02:17，北京时间 10:17）。合并时保留本分支的工作流配置；其他文件发生冲突会停止流程，需要手动处理后再发布。
+
+## 上游与许可证
+
+本项目基于 [Charm 的 Crush](https://github.com/charmbracelet/crush)，本仓库提供的安装包属于个人维护分支。许可证沿用 [FSL-1.1-MIT](LICENSE.md)。以下保留上游原始说明，便于查阅完整功能和使用参考。
+
+<details>
+<summary><strong>展开上游完整说明与配置参考</strong></summary>
+
 # Crush
 
 <p align="center">
@@ -1068,3 +1190,5 @@ Part of [Charm](https://charm.land).
 
 <!--prettier-ignore-->
 Charm热爱开源 • Charm loves open source
+
+</details>
