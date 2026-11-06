@@ -74,6 +74,7 @@ func TestBashTool_DefaultAutoBackgroundThreshold(t *testing.T) {
 	var meta BashResponseMetadata
 	require.NoError(t, json.Unmarshal([]byte(resp.Metadata), &meta))
 	require.False(t, meta.Background)
+	require.False(t, meta.AutoBackground)
 	require.Empty(t, meta.ShellID)
 	require.Contains(t, meta.Output, "done")
 }
@@ -92,12 +93,14 @@ func TestBashTool_CustomAutoBackgroundThreshold(t *testing.T) {
 	require.False(t, resp.IsError)
 	var meta BashResponseMetadata
 	require.NoError(t, json.Unmarshal([]byte(resp.Metadata), &meta))
-	require.True(t, meta.Background)
-	require.NotEmpty(t, meta.ShellID)
-	require.Contains(t, resp.Content, "moved to background")
-
 	bgManager := shell.GetBackgroundShellManager()
-	require.NoError(t, bgManager.Kill(meta.ShellID))
+	t.Cleanup(func() { _ = bgManager.Kill(meta.ShellID) })
+
+	require.True(t, meta.Background)
+	require.True(t, meta.AutoBackground)
+	require.NotEmpty(t, meta.ShellID)
+	require.Contains(t, resp.Content, meta.ShellID)
+	require.Contains(t, resp.Content, JobOutputToolName)
 }
 
 type recordingPermissionService struct {
