@@ -7,8 +7,15 @@ import (
 
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/ui/common"
+	"github.com/charmbracelet/crush/internal/ui/list"
 	"github.com/charmbracelet/x/ansi"
 )
+
+// GroupedWith keeps consecutive tool calls together without blank rows.
+func (t *baseToolMessageItem) GroupedWith(next list.Item) bool {
+	_, ok := next.(ToolMessageItem)
+	return ok
+}
 
 func (t *baseToolMessageItem) renderSummary(width int) string {
 	params := partialJSONFields(t.toolCall.Input)

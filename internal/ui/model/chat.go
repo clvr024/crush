@@ -274,11 +274,10 @@ func (m *Chat) Draw(scr uv.Screen, area uv.Rectangle) {
 		drawCachedBuffer(scr, listArea, m.drawCache.buf)
 	}
 
-	// Draw scrollbar if visible and needed. Only reached when not resizing
-	// (showScrollbar requires it), so TotalHeight is already computed and
-	// cached above.
+	// Measure heights before looking up the cached offset. Scrolling a warm
+	// list then avoids walking every item preceding the viewport.
 	if scrollbarWidth > 0 {
-		scrollbar := common.Scrollbar(m.com.Styles, listHeight, m.list.TotalHeight()-1, listHeight, m.list.Offset())
+		scrollbar := common.Scrollbar(m.com.Styles, listHeight, m.list.TotalHeight()-1, listHeight, m.list.CachedOffset())
 		if scrollbar != "" {
 			scrollbarArea := image.Rectangle{
 				Min: image.Point{X: area.Max.X - scrollbarWidth, Y: area.Min.Y},
@@ -1228,7 +1227,7 @@ func (m *Chat) HighlightContent() string {
 				endLine,
 				endCol,
 			))
-			sb.WriteString(strings.Repeat("\n", m.list.Gap()))
+			sb.WriteString(strings.Repeat("\n", m.list.GapAfter(i)))
 		}
 	}
 

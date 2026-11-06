@@ -39,6 +39,8 @@ type List struct {
 	// viewport width changes (which can alter per-item line counts).
 	totalHeightCache int
 	totalHeightValid bool
+	// itemOffsets caches each item's starting line alongside totalHeightCache.
+	itemOffsets []int
 
 	// cache is the F6 list-level render memo, keyed by item pointer.
 	// Each entry stores the rendered content, a pre-split slice of
@@ -112,6 +114,7 @@ func (l *List) SetSize(width, height int) {
 // SetGap sets the gap between items.
 func (l *List) SetGap(gap int) {
 	l.gap = gap
+	l.totalHeightValid = false
 }
 
 // Gap returns the gap between items.
@@ -139,7 +142,7 @@ func (l *List) AtBottom() bool {
 		item := l.getItem(idx)
 		itemHeight := item.height
 		if l.gap > 0 && idx > l.offsetIdx {
-			itemHeight += l.gap
+			itemHeight += l.GapAfter(idx - 1)
 		}
 		totalHeight += itemHeight
 	}
@@ -176,15 +179,17 @@ func (l *List) TotalHeight() int {
 	}
 	total := 0
 	for idx := range l.items {
+		l.cacheItemOffset(idx, total)
 		entry := l.renderItemEntry(idx)
 		if entry == nil {
 			continue
 		}
 		total += entry.height
 		if l.gap > 0 && idx < len(l.items)-1 {
-			total += l.gap
+			total += l.GapAfter(idx)
 		}
 	}
+	l.cacheItemOffset(len(l.items), total)
 	l.totalHeightCache = total
 	l.totalHeightValid = true
 	return total
@@ -217,7 +222,7 @@ func (l *List) Overflows(height int) bool {
 	for idx := len(l.items) - 1; idx >= 0; idx-- {
 		total += l.getItem(idx).height
 		if l.gap > 0 && idx < len(l.items)-1 {
-			total += l.gap
+			total += l.GapAfter(idx)
 		}
 		if total > height {
 			return true
@@ -255,7 +260,7 @@ func (l *List) Offset() int {
 		item := l.getItem(idx)
 		offset += item.height
 		if l.gap > 0 && idx < len(l.items)-1 {
-			offset += l.gap
+			offset += l.GapAfter(idx)
 		}
 	}
 	offset += l.offsetLine
@@ -271,7 +276,7 @@ func (l *List) lastOffsetItem() (int, int, int) {
 		item := l.getItem(idx)
 		itemHeight := item.height
 		if l.gap > 0 && idx < len(l.items)-1 {
-			itemHeight += l.gap
+			itemHeight += l.GapAfter(idx)
 		}
 		totalHeight += itemHeight
 		if totalHeight > l.height {
@@ -390,10 +395,10 @@ func (l *List) invalidateAll() {
 }
 
 // Invalidate drops the cache entry for the given item, forcing a
-// re-render on the next getItem call. No-op if the item is not in
-// the cache.
+// re-render on the next getItem call.
 func (l *List) Invalidate(item Item) {
 	delete(l.cache, item)
+	l.totalHeightValid = false
 }
 
 // InvalidateFrozen drops the frozen flag (and stored content) for the
@@ -401,6 +406,7 @@ func (l *List) Invalidate(item Item) {
 // frozen-items vocabulary so external callers can express intent.
 func (l *List) InvalidateFrozen(item Item) {
 	delete(l.cache, item)
+	l.totalHeightValid = false
 }
 
 // retainCacheFor drops every cache entry whose key is not in the given
@@ -495,7 +501,7 @@ func (l *List) ScrollBy(lines int) {
 		for l.offsetLine >= currentItem.height {
 			l.offsetLine -= currentItem.height
 			if l.gap > 0 {
-				l.offsetLine = max(0, l.offsetLine-l.gap)
+				l.offsetLine = max(0, l.offsetLine-l.GapAfter(l.offsetIdx))
 			}
 
 			// Move to next item
@@ -528,7 +534,7 @@ func (l *List) ScrollBy(lines int) {
 			prevItem := l.getItem(l.offsetIdx)
 			totalHeight := prevItem.height
 			if l.gap > 0 {
-				totalHeight += l.gap
+				totalHeight += l.GapAfter(l.offsetIdx)
 			}
 			l.offsetLine += totalHeight
 		}
@@ -550,7 +556,7 @@ func (l *List) VisibleItemIndices() (startIdx, endIdx int) {
 		item := l.getItem(currentIdx)
 		visibleHeight += item.height
 		if l.gap > 0 {
-			visibleHeight += l.gap
+			visibleHeight += l.GapAfter(currentIdx)
 		}
 
 		if visibleHeight >= l.height {
@@ -598,6 +604,7 @@ func (l *List) Render() string {
 		}
 		itemLines := entry.lines
 		itemHeight := len(itemLines)
+		gap := l.GapAfter(currentIdx)
 
 		if currentOffset >= 0 && currentOffset < itemHeight {
 			// Append only the visible slice that fits in the
@@ -615,7 +622,7 @@ func (l *List) Render() string {
 			// remaining budget so a 30k-line item with a
 			// trailing gap can't push past the viewport.
 			if l.gap > 0 {
-				gapBudget := min(budget-len(lines), l.gap)
+				gapBudget := min(budget-len(lines), gap)
 				for range gapBudget {
 					lines = append(lines, "")
 				}
@@ -623,7 +630,7 @@ func (l *List) Render() string {
 		} else {
 			// offsetLine starts inside the gap.
 			gapOffset := currentOffset - itemHeight
-			gapRemaining := l.gap - gapOffset
+			gapRemaining := gap - gapOffset
 			if gapRemaining > 0 {
 				gapBudget := min(budget-len(lines), gapRemaining)
 				for range gapBudget {
@@ -776,7 +783,7 @@ func (l *List) ScrollToSelected() {
 			item := l.getItem(i)
 			totalHeight += item.height
 			if l.gap > 0 && i < l.selectedIdx {
-				totalHeight += l.gap
+				totalHeight += l.GapAfter(i)
 			}
 			if totalHeight >= l.height {
 				l.offsetIdx = i
@@ -974,7 +981,7 @@ func (l *List) findItemAtY(_, y int) (itemIdx int, itemY int) {
 		// Move to next item
 		currentLine = itemEndLine
 		if l.gap > 0 {
-			currentLine += l.gap
+			currentLine += l.GapAfter(currentIdx)
 		}
 		currentIdx++
 	}
