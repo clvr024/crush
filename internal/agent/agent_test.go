@@ -41,7 +41,7 @@ func setupAgent(t *testing.T, pair modelPair) (SessionAgent, fakeEnv) {
 	env := testEnv(t)
 
 	createSimpleGoProject(t, env.workingDir)
-	// Tool cassettes contain no title requests; titles have separate tests.
+	// Titles use a fixed model; unused title recordings have been removed.
 	agent, err := coderAgent(r, env, large, fastModel{})
 	require.NoError(t, err)
 	t.Cleanup(agent.CancelAll)

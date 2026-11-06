@@ -52,9 +52,21 @@ jobs:
           go-version-file: go.mod
 
       - name: Test merged code
+        id: tests
         if: steps.merge.outputs.should_release == 'true'
         timeout-minutes: 20
-        run: go test -v -failfast -timeout=10m ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -json -failfast -timeout=10m ./... | python3 .github/scripts/report-go-tests.py "$RUNNER_TEMP/go-test.jsonl"
+
+      - name: Save failed test log
+        if: failure() && steps.tests.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: go-test-log
+          path: ${{ runner.temp }}/go-test.jsonl
+          retention-days: 7
 
       - name: Push merge
         if: steps.merge.outputs.changed == 'true'
