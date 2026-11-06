@@ -18,6 +18,7 @@ func TestDetachStderr(t *testing.T) {
 	realStderr, err := unix.Dup(2)
 	require.NoError(t, err)
 	realStderrFile := os.Stderr
+	realStderrFD := realStderrFile.Fd()
 	t.Cleanup(func() {
 		_ = unix.Dup2(realStderr, 2)
 		_ = unix.Close(realStderr)
@@ -50,5 +51,7 @@ func TestDetachStderr(t *testing.T) {
 	got, err := os.ReadFile(capturePath)
 	require.NoError(t, err)
 	require.Equal(t, "go write\nchild write\nrestored write\n", string(got))
-	require.Equal(t, uintptr(2), os.Stderr.Fd())
+	// JSON test mode can make os.Stderr share os.Stdout's descriptor.
+	require.Same(t, realStderrFile, os.Stderr)
+	require.Equal(t, realStderrFD, os.Stderr.Fd())
 }
