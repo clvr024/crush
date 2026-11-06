@@ -18,13 +18,11 @@ var (
 	BuildID = ""
 )
 
-// A user may install crush using `go install github.com/charmbracelet/crush@latest`.
-// without -ldflags, in which case the version above is unset. As a workaround
-// we use the embedded build version that *is* set when using `go install` (and
-// is only set for `go install` and not for `go build`).
+// Use the embedded module version when no version was injected via ldflags.
+// This supports go install while preserving the version set by release builds.
 func init() {
 	info, ok := debug.ReadBuildInfo()
-	if ok {
+	if ok && Version == "devel" {
 		mainVersion := info.Main.Version
 		if mainVersion != "" && mainVersion != "(devel)" {
 			Version = mainVersion
