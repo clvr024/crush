@@ -346,8 +346,13 @@ func executeBashCommand(ctx context.Context, params BashParams, execWorkingDir, 
 			return fantasy.NewTextErrorResponse("Failed to start background shell: " + err.Error()), nil
 		}
 
-		// Wait a short time to detect fast failures (blocked commands, syntax errors, etc.)
-		time.Sleep(1 * time.Second)
+		// Wait up to one second to detect fast completion or failure.
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		select {
+		case <-bgShell.Done():
+		case <-timer.C:
+		}
 		stdout, stderr, done, execErr := bgShell.GetOutput()
 
 		if done {
@@ -367,14 +372,15 @@ func executeBashCommand(ctx context.Context, params BashParams, execWorkingDir, 
 				EndTime:          time.Now().UnixMilli(),
 				Output:           stdout,
 				Description:      params.Description,
-				Background:       params.RunInBackground,
 				WorkingDirectory: bgShell.WorkingDir,
 			}
 			if stdout == "" {
 				return fantasy.WithResponseMetadata(fantasy.NewTextResponse(BashNoOutput), metadata), nil
 			}
 			stdout += fmt.Sprintf("\n\n<cwd>%s</cwd>", normalizeWorkingDir(bgShell.WorkingDir))
-			return fantasy.WithResponseMetadata(fantasy.NewTextResponse(stdout), metadata), nil
+			resp := fantasy.NewTextResponse(stdout)
+			resp.IsError = execErr != nil
+			return fantasy.WithResponseMetadata(resp, metadata), nil
 		}
 
 		// Still running after fast-failure check - return as background job
@@ -436,14 +442,15 @@ func executeBashCommand(ctx context.Context, params BashParams, execWorkingDir, 
 			EndTime:          time.Now().UnixMilli(),
 			Output:           stdout,
 			Description:      params.Description,
-			Background:       params.RunInBackground,
 			WorkingDirectory: bgShell.WorkingDir,
 		}
 		if stdout == "" {
 			return fantasy.WithResponseMetadata(fantasy.NewTextResponse(BashNoOutput), metadata), nil
 		}
 		stdout += fmt.Sprintf("\n\n<cwd>%s</cwd>", normalizeWorkingDir(bgShell.WorkingDir))
-		return fantasy.WithResponseMetadata(fantasy.NewTextResponse(stdout), metadata), nil
+		resp := fantasy.NewTextResponse(stdout)
+		resp.IsError = execErr != nil
+		return fantasy.WithResponseMetadata(resp, metadata), nil
 	}
 
 	// Still running - keep as background job
